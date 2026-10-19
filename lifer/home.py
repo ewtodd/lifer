@@ -58,6 +58,33 @@ def trip_id_for(folder: Path, root: Path | str | None = None) -> str:
     return "--".join(rel.parts) if rel.parts else folder.name
 
 
+# Subfolders that hold an outing's raws and take the parent's trip ID:
+# their photos are the outing, not a nested trip (task 24).
+RAW_BUCKET_NAMES = ("raw", "nef")
+
+
+def is_raw_bucket(folder: Path) -> bool:
+    """True for a folder named like a raw bucket (RAW, raw, NEF;
+    case-insensitive) that actually holds .NEF files."""
+    folder = Path(folder)
+    return (folder.name.lower() in RAW_BUCKET_NAMES
+            and any(p.is_file() and p.suffix.lower() == ".nef"
+                    for p in folder.iterdir()))
+
+
+def effective_trip_id(folder: Path, root: Path | str | None = None) -> str:
+    """trip_id_for, except a raw bucket takes its parent's trip ID:
+    `root/2021-07-28-DAVIE/RAW` runs as trip `2021-07-28-DAVIE`, and region
+    matching uses that ID. A top-level folder named RAW (no parent outing)
+    keeps its own ID."""
+    folder = Path(folder).expanduser().resolve()
+    if root is not None:
+        root_r = Path(root).expanduser().resolve()
+        if is_raw_bucket(folder) and folder.parent != root_r:
+            return trip_id_for(folder.parent, root)
+    return trip_id_for(folder, root)
+
+
 def source_folder_for_trip(trip_id: str) -> Path:
     """The source photo folder a trip was run from. `lifer run` records it in
     runs/<trip>/meta.json (needed for nested folders, which are not at

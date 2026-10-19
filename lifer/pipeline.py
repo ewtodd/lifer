@@ -27,7 +27,7 @@ from .bursts import Encounter, FrameInfo, group_into_encounters
 from .detect import (BirdDetector, Detection, FrameDetections, sharpness,
                      square_crop, usable_crop)
 from .extract import jpeg_to_image, load_frame, load_frame_jpg, load_photo
-from .home import lifer_home, find_regions_toml, trip_id_for
+from .home import effective_trip_id, find_regions_toml, lifer_home
 from .lifelist import (LifeEntry, lifer_set, match_lifelist, parse_lifelist,
                        write_lifelist_csv)
 from .outputs import Candidate, save_crop, save_frame_preview, write_candidates_csv, write_review_html
@@ -217,7 +217,7 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
     if not folder.is_dir():
         raise SystemExit(f"not a directory: {folder}")
     home = lifer_home()
-    name = trip_id_for(folder, root)
+    name = effective_trip_id(folder, root)
     out_dir = home / "runs" / name
     cache_dir = home / "cache" / name
     inat_cache = home / "cache" / "inat"

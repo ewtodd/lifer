@@ -43,6 +43,33 @@ def main() -> None:
     runall.add_argument("--conf", type=float, default=0.25, help="detection confidence threshold (default 0.25)")
     runall.add_argument("--temp", type=float, default=3.0,
                         help="BioCLIP temperature: logits/T before softmax (default 3.0)")
+    runall.add_argument("--apply-migrations", action="store_true",
+                        help="after the trips have run, apply the task-24 trip "
+                             "migrations (rekey RAW-bucket trips into their "
+                             "parent, map derived-copy decisions onto the raw "
+                             "frames)")
+
+    migr = sub.add_parser(
+        "migrate-trips",
+        help="rekey trip state after the task-24 rules "
+             "(dry run without --apply)")
+    migr.add_argument("--root", default=str(Path.home() / "BIRDING"),
+                      help="archive root the current plan is built from "
+                           "(default: ~/BIRDING)")
+    migr.add_argument("--apply", action="store_true",
+                      help="write the changes (default: print the plan only)")
+    migr.add_argument("--db", default=None,
+                      help="decisions DB (default: LIFER_HOME/data/lifer.sqlite)")
+
+    delete = sub.add_parser(
+        "delete",
+        help="remove a trip's run dir, cache, and DB rows "
+             "(dry run without --apply)")
+    delete.add_argument("trips", nargs="+", help="trip ID(s) to delete")
+    delete.add_argument("--apply", action="store_true",
+                        help="delete (default: print what would be deleted)")
+    delete.add_argument("--db", default=None,
+                        help="decisions DB (default: LIFER_HOME/data/lifer.sqlite)")
 
     serve = sub.add_parser("serve", help="serve the review web app (default 127.0.0.1)")
     serve.add_argument("--host", default="127.0.0.1", help="interface to bind (default 127.0.0.1)")
@@ -119,6 +146,7 @@ def main() -> None:
         run_all(
             args.root,
             dry_run=args.dry_run,
+            apply_migrations=args.apply_migrations,
             gap_seconds=args.gap,
             alpha=args.alpha,
             yolo_weights=args.yolo,
@@ -168,6 +196,108 @@ def main() -> None:
     elif args.cmd == "migrate":
         from .migrate import run_migrate
         sys.exit(run_migrate(apply=args.apply))
+    elif args.cmd == "migrate-trips":
+        _cmd_migrate_trips(args)
+    elif args.cmd == "delete":
+        _cmd_delete(args)
+
+
+def _open_decisions_db(db_arg: str | None):
+    """The decisions DB for migrate-trips/delete (default: LIFER_HOME)."""
+    from .home import lifer_home
+    import sqlite3
+    path = (Path(db_arg).expanduser() if db_arg
+            else lifer_home() / "data" / "lifer.sqlite")
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    return path, conn
+
+
+def _validate_trip_ids(trips: list[str]) -> None:
+    for t in trips:
+        if not t or "/" in t or t in (".", "..") or t.startswith("-"):
+            raise SystemExit(f"invalid trip ID: {t!r}")
+
+
+def _cmd_migrate_trips(args) -> None:
+    from .runall import build_plan
+    import tomllib
+    from .home import find_regions_toml, lifer_home
+    from .trips_ops import (apply_migrate_trips, migration_summary,
+                            plan_migrate_trips)
+
+    root = Path(args.root).expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(f"not a directory: {root}")
+    regions = tomllib.loads(find_regions_toml().read_text()).get("region", [])
+    rows = build_plan(root, regions)
+    home = lifer_home()
+    db_path, conn = _open_decisions_db(args.db)
+    try:
+        if args.apply:
+            res = apply_migrate_trips(home, conn, root, rows)
+            print(f"migrate-trips (applied, db: {db_path})")
+            print(migration_summary(res))
+        else:
+            res = plan_migrate_trips(home, conn, root, rows)
+            print(f"migrate-trips (dry run, db: {db_path}; "
+                  f"re-run with --apply to write the changes)")
+            n = len(res["rekey"]) + len(res["map"])
+            if not n and not res["unmapped"] and not res["conflicts"]:
+                print("nothing to migrate")
+            for e in res["rekey"]:
+                print(f"  rekey {e['from']} -> {e['to']}: "
+                      f"{e['decisions']} decisions, "
+                      f"{e['crop_overrides']} crop fixes, "
+                      f"{e['chosen_frames']} chosen frames")
+                for c in e["conflicts"]:
+                    print(f"    conflict (left in place): {c}")
+                for m in e["mismatched"]:
+                    print(f"    no longer matches {e['to']}'s candidates: {m}")
+            for m in res["map"]:
+                print(f"  map {m['from']}/{m['enc_id']} {m['frame']} "
+                      f"-> {m['to_trip']}/{m['to_enc_id']} {m['to_frame']} "
+                      f"({m['action']}{', ' + m['species'] if m['species'] else ''})")
+            for u in res["unmapped"]:
+                print(f"  unmapped (left in place): {u['trip']}/{u['enc_id']} "
+                      f"{u['frame']} -- {u['reason']}")
+            for c in res["conflicts"]:
+                print(f"  conflict (left in place): {c['trip']}/{c['enc_id']} "
+                      f"{c['frame']} -- {c['reason']}")
+            if n:
+                print(f"total: {n} to migrate, {len(res['unmapped'])} unmapped, "
+                      f"{len(res['conflicts'])} conflicts")
+    finally:
+        conn.close()
+
+
+def _cmd_delete(args) -> None:
+    _validate_trip_ids(args.trips)
+    from .home import lifer_home
+    from .trips_ops import apply_delete, plan_delete
+
+    home = lifer_home()
+    db_path, conn = _open_decisions_db(args.db)
+    try:
+        if args.apply:
+            res = apply_delete(home, conn, args.trips)
+            print(f"deleted (db: {db_path}):")
+            for t in res["trips"]:
+                print(f"  {t['trip']}: {t['run_files']} run files, "
+                      f"{t['cache_files']} cache files, {t['decisions']} "
+                      f"decisions, {t['crop_overrides']} crop fixes, "
+                      f"{t['chosen_frames']} chosen frames")
+        else:
+            res = plan_delete(home, conn, args.trips)
+            print(f"delete (dry run, db: {db_path}; re-run with --apply):")
+            for t in res["trips"]:
+                print(f"  {t['trip']}: would remove {t['run_files']} run files, "
+                      f"{t['cache_files']} cache files, {t['decisions']} "
+                      f"decisions, {t['crop_overrides']} crop fixes, "
+                      f"{t['chosen_frames']} chosen frames")
+            print("  nothing under the photo archive is ever touched")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

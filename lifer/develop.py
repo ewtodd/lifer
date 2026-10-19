@@ -32,7 +32,7 @@ import numpy as np
 from PIL import Image
 
 from .extract import load_frame
-from .home import lifer_home, trip_id_for
+from .home import effective_trip_id, lifer_home
 from .dxmp import (NO_MASK_BLENDOP, Module, crop_params, decode_params,
                    exposure_params, toneequal_params, write_sidecar)
 from .dtstyle import build_template
@@ -485,7 +485,7 @@ def develop(source_folder: str, species: str = "", n: int = 5,
                          "(--style-sidecar, an edited .xmp)")
     home = lifer_home()
     source = Path(source_folder).expanduser()
-    folder = trip_id_for(source, root)
+    folder = effective_trip_id(source, root)
     run_dir = home / "runs" / folder
     cache_dir = home / "cache" / folder
     src_dir = home / "develop" / folder / "src"
@@ -587,7 +587,7 @@ def benchmark(source_folder: str, reference_dir: Path,
                          "(--style-sidecar, an edited .xmp)")
     home = lifer_home()
     source = Path(source_folder).expanduser()
-    folder = trip_id_for(source, root)
+    folder = effective_trip_id(source, root)
     cache_dir = home / "cache" / folder
     src_dir = home / "develop" / folder / "src"
     bench = home / "edits" / "benchmark"

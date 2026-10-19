@@ -17,7 +17,7 @@
   <table class="tbl">
     <tr>
       <th>Trip</th><th>Date</th><th>Region</th><th>Encounters</th>
-      <th>Review progress</th><th>Rare / lifer pending</th>
+      <th>Review progress</th><th>Rare / lifer pending</th><th></th>
     </tr>
     {% for t in trips %}
     <tr>
@@ -30,11 +30,13 @@
         <span class="prog-n">{{ t.decided }}/{{ t.total }}</span>
       </td>
       <td>{% if t.pending %}<span class="badge rare">{{ t.pending }} pending</span>{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
+      <td><button class="btn sm" data-delete="{{ t.folder }}" title="Delete this trip's runs, cache, and decisions">Delete</button></td>
     </tr>
     {% else %}
-    <tr><td colspan="6" class="muted">No processed trips yet. Run <code>nix run . -- run &lt;folder&gt;</code> first.</td></tr>
+    <tr><td colspan="7" class="muted">No processed trips yet. Run <code>nix run . -- run &lt;folder&gt;</code> first.</td></tr>
     {% endfor %}
   </table>
 </main>
+{% include "_delete_modal.html" %}
 </body>
 </html>

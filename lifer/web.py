@@ -21,7 +21,8 @@ import tomllib
 from datetime import date, datetime
 from pathlib import Path
 
-from flask import (Flask, g, jsonify, render_template, request, send_file)
+from flask import (Flask, abort, g, jsonify, render_template, request,
+                   send_file)
 from PIL import Image
 from rapidfuzz import fuzz, process
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -318,6 +319,11 @@ def _parse_date(s: str):
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
+
+def _valid_tid(tid: str) -> bool:
+    """A trip ID is a single path segment: no slashes, no dot-segments."""
+    return bool(tid) and "/" not in tid and tid not in (".", "..")
+
 
 def _init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -968,7 +974,7 @@ def create_app(db_path: Path) -> Flask:
     @app.route("/trip/<folder>")
     def page_trip(folder: str):
         if not (RUNS / folder / "candidates.csv").is_file():
-            app.abort(404)
+            abort(404)
         trip = build_trip(folder, g.db)
         data_json = json.dumps(trip, default=str).replace("</", "<\\/")
         return render_template("trip.html", t=trip, data_json=data_json,
@@ -995,12 +1001,12 @@ def create_app(db_path: Path) -> Flask:
         if rel.startswith("frames/src/") and rel.endswith(".jpg"):
             p = _ensure_src_preview(folder, rel[len("frames/src/"):-4])
             if p is None:
-                app.abort(404)
+                abort(404)
             return send_file(p)
         base = (RUNS / folder).resolve()
         p = (base / rel).resolve()
         if not str(p).startswith(str(base) + os.sep) or not p.is_file():
-            app.abort(404)
+            abort(404)
         return send_file(p)
 
     # ---- API ----------------------------------------------------------------
@@ -1224,6 +1230,31 @@ def create_app(db_path: Path) -> Flask:
         if fmt == "ods":
             return _ods_export(cols, data)
         return jsonify(ok=False, error="format must be csv|ods"), 400
+
+    # ---- delete trip (task 24) ---------------------------------------------
+
+    @app.route("/api/delete/plan")
+    def api_delete_plan():
+        """What 'Delete trip' would remove for one trip. Nothing is touched."""
+        from .trips_ops import plan_delete
+        tid = request.args.get("folder", "")
+        if not _valid_tid(tid):
+            return jsonify(ok=False, error="bad trip ID"), 400
+        return jsonify(ok=True, **plan_delete(lifer_home(), g.db, [tid]))
+
+    @app.route("/api/delete", methods=["POST"])
+    def api_delete():
+        """Delete a trip's run dir, cache, and DB rows. The client must echo
+        the trip ID in `confirm` (typed confirmation in the dialog)."""
+        from .trips_ops import apply_delete
+        p = request.get_json(force=True) or {}
+        tid = p.get("folder") or ""
+        if not _valid_tid(tid):
+            return jsonify(ok=False, error="bad trip ID"), 400
+        if p.get("confirm") != tid:
+            return jsonify(ok=False,
+                           error="confirmation does not match the trip ID"), 400
+        return jsonify(ok=True, **apply_delete(lifer_home(), g.db, [tid]))
 
     return app
 

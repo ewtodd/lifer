@@ -28,6 +28,8 @@
     <span class="counts-prog" id="progress"></span>
     <label class="toggle"><input type="checkbox" id="hideDecided"> hide decided</label>
     <a href="/lifelist">Lifelist</a>
+    <button class="btn sm" data-delete="{{ t.folder }}"
+            title="Delete this trip's runs, cache, and decisions">Delete trip</button>
   </nav>
 </header>
 <main id="top">
@@ -700,5 +702,7 @@ document.addEventListener('keydown', function (e3) {
   refreshDom();
 })();
 </script>
+{% set trip = t.folder %}
+{% include "_delete_modal.html" %}
 </body>
 </html>

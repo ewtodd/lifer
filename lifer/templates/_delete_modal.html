@@ -1,0 +1,131 @@
+{# Delete-trip confirmation dialog (task 24). Include once per page after
+   the body content; the page renders buttons with data-delete="<trip id>".
+   The dialog shows what would be removed, then requires typing the trip
+   ID before the delete button is enabled. #}
+<style>
+.del-backdrop {
+  position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:60;
+  display:flex; align-items:center; justify-content:center;
+}
+.del-box {
+  background:var(--card); color:var(--fg); border:1px solid var(--border);
+  border-radius:10px; box-shadow:0 12px 40px rgba(0,0,0,.35);
+  width:min(560px, calc(100vw - 32px)); max-height:calc(100vh - 64px);
+  overflow:auto; padding:18px 20px;
+}
+.del-box h2 { margin:0 0 10px; font-size:1.05rem; }
+.del-box h2 code { font-size:.95rem; color:var(--rare-fg); }
+.del-list { margin:8px 0; padding-left:20px; }
+.del-list li { margin:3px 0; }
+.del-confirm { display:block; margin:12px 0 4px; font-size:.85rem; color:var(--muted); }
+.del-confirm input {
+  display:block; width:100%; margin-top:4px; font:inherit; font-size:.9rem;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  padding:7px 9px; color:var(--fg); background:var(--bg);
+  border:1px solid var(--border); border-radius:6px;
+}
+.del-btns { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; }
+.del-err { color:var(--rare-fg); margin:10px 0 0; }
+</style>
+
+<div class="del" id="delmodal" data-trip="{{ trip | default('', true) }}" hidden>
+  <div class="del-backdrop">
+    <div class="del-box" role="dialog" aria-modal="true" aria-label="Delete trip">
+      <h2>Delete trip <code id="del-tid"></code></h2>
+      <div id="del-body"><p class="muted">Loading&hellip;</p></div>
+      <label class="del-confirm">Type the trip ID to confirm:
+        <input type="text" id="del-input" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="del-btns">
+        <button class="btn" id="del-cancel" type="button">Cancel</button>
+        <button class="btn" id="del-ok" type="button" disabled>Delete trip</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const m = document.getElementById('delmodal');
+  if (!m) return;
+  const pageTrip = m.dataset.trip || null;  // set on the trip page
+  const body = document.getElementById('del-body');
+  const input = document.getElementById('del-input');
+  const okBtn = document.getElementById('del-ok');
+  document.getElementById('del-cancel').addEventListener('click', close);
+  const backdrop = m.querySelector('.del-backdrop');
+  backdrop.addEventListener('click', (e) => {
+    if (e.target === backdrop) close();  // not a click inside the box
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !m.hidden) close();
+  });
+  let tid = null;
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g,
+      (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function close() { m.hidden = true; }
+  async function open() {
+    m.hidden = false;
+    input.value = '';
+    okBtn.disabled = true;
+    document.getElementById('del-tid').textContent = tid;
+    body.innerHTML = '<p class="muted">Loading&hellip;</p>';
+    let j;
+    try {
+      const r = await fetch('/api/delete/plan?folder=' + encodeURIComponent(tid));
+      j = await r.json();
+    } catch (e) {
+      body.innerHTML = '<p class="del-err">Could not load the delete plan.</p>';
+      return;
+    }
+    if (!j.ok) {
+      body.innerHTML = '<p class="del-err">' + esc(j.error) + '</p>';
+      return;
+    }
+    const t = j.trips[0];
+    body.innerHTML =
+      '<ul class="del-list">' +
+      '<li>run directory: <code>runs/' + esc(t.trip) + '</code> ' +
+        '(' + t.run_files + ' files)</li>' +
+      '<li>frame cache: <code>cache/' + esc(t.trip) + '</code> ' +
+        '(' + t.cache_files + ' files)</li>' +
+      '<li>decisions: ' + t.decisions + '</li>' +
+      '<li>crop fixes: ' + t.crop_overrides + '</li>' +
+      '<li>chosen frames (develop/edits): ' + t.chosen_frames + ' files</li>' +
+      '</ul>' +
+      '<p class="muted" style="margin:8px 0 0;font-size:.8rem">' +
+      'Everything listed lives under <code>~/.local/share/lifer</code>. ' +
+      'Your photos in the archive are never touched.</p>';
+    input.focus();
+  }
+  input.addEventListener('input', () => { okBtn.disabled = input.value !== tid; });
+  okBtn.addEventListener('click', async () => {
+    okBtn.disabled = true;
+    const r = await fetch('/api/delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({folder: tid, confirm: input.value}),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      body.innerHTML = '<p class="del-err">' +
+        esc(j.error || ('delete failed: HTTP ' + r.status)) + '</p>';
+      okBtn.disabled = false;
+      return;
+    }
+    window.location.href = '/';
+  });
+  // Any button tagged data-delete opens the dialog for that trip.
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-delete]');
+    if (b && b.dataset.delete) { tid = b.dataset.delete; open(); }
+  });
+  // ?delete=1 opens the dialog for the page's trip (screenshots/tests).
+  if (new URLSearchParams(location.search).has('delete') && pageTrip) {
+    tid = pageTrip;
+    open();
+  }
+})();
+</script>
