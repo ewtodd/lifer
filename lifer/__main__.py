@@ -117,6 +117,24 @@ def main() -> None:
                          help="folder with the reference's edited .xmp sidecars, "
                               "for the final crops (default: the --reference folder)")
 
+    handoff = sub.add_parser(
+        "handoff",
+        help="hand confirmed encounters' raws + darktable history to the owner")
+    handoff.add_argument("folder",
+                         help="a run folder (dir of .NEFs) or a trip ID "
+                              "whose confirmed encounters to hand off")
+    handoff.add_argument("--dest", default=None,
+                         help="destination folder (default: ~/Pictures/<folder>); "
+                              "never under the read-only BIRDING share")
+    handoff.add_argument("--db", default=None,
+                         help="decisions/override DB (default: LIFER_HOME data/lifer.sqlite)")
+    handoff.add_argument("--style-sidecar", default=None,
+                         help="sidecar .xmp defining the develop style, used when "
+                              "a chosen frame has no edit yet "
+                              "(default: [develop].style_sidecar in config.toml)")
+    handoff.add_argument("--root", default=None,
+                         help="archive root the trip ID is relative to")
+
     style = sub.add_parser("dt-style",
                            help="summarise a darktable develop style from edited sidecars")
     style.add_argument("--sidecars", default=None,
@@ -200,6 +218,15 @@ def main() -> None:
         else:
             develop(args.folder, frames=frames, style_sidecar=style_sidecar,
                     root=args.root)
+    elif args.cmd == "handoff":
+        from .handoff import handoff
+        sys.exit(handoff(
+            args.folder,
+            dest=Path(args.dest).expanduser() if args.dest else None,
+            db_path=Path(args.db).expanduser() if args.db else None,
+            style_sidecar=(Path(args.style_sidecar).expanduser()
+                           if args.style_sidecar else None),
+            root=args.root))
     elif args.cmd == "dt-style":
         from .dtstyle import run_dt_style
         run_dt_style(sidecars=args.sidecars, source=args.source)

@@ -23,6 +23,7 @@ import json
 import math
 import re
 import shutil
+import sqlite3
 import struct
 import subprocess
 from dataclasses import dataclass
@@ -31,11 +32,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from .boxes import get_box, open_db, representative_frame
 from .extract import load_frame
 from .home import effective_trip_id, lifer_home
 from .dxmp import (NO_MASK_BLENDOP, Module, crop_params, decode_params,
                    exposure_params, toneequal_params, write_sidecar)
 from .dtstyle import build_template
+from .watermark import Watermark, apply_watermark, map_box
 
 # Soft-crop threshold: Laplacian variance of the bird crop below this is
 # treated as out-of-focus / motion blur and skipped (from runs/cache).
@@ -110,14 +113,22 @@ def _adj_top1(adj_top3: str) -> tuple[str, float]:
 
 def _pick_frame_names(
     candidates: list[dict], cache_dir: Path, species: str, n: int,
+    folder: str = "", conn: sqlite3.Connection | None = None,
 ) -> list[str]:
-    """Sharpest-frame-per-encounter selection."""
+    """Sharpest representatives: one representative_frame per encounter.
+
+    Goes through ``representative_frame`` (task 12) so a photo the owner picked
+    for an encounter is developed instead of whatever the detector scored as
+    sharpest; the candidate rows are per-encounter.
+    """
+    conn = conn or open_db()
     scored: list[tuple[float, float, str]] = []
     for c in candidates:
         top1, prob = _adj_top1(c["adj_top3"])
         if top1.lower() != species.lower():
             continue
-        frame = c["best_frame"]
+        frames = [x for x in (c.get("frames") or "").split(",") if x]
+        frame = representative_frame(conn, folder, frames, c["best_frame"])
         data = _cache_frame(cache_dir, frame)
         if data is None:
             continue
@@ -478,21 +489,30 @@ def _reference_crops(reference_sidecars: Path) -> dict[str, tuple[float, float, 
 def develop(source_folder: str, species: str = "", n: int = 5,
             frames: list[str] | None = None, lift: float = BIRD_LIFT,
             style_sidecar: Path | None = None,
-            root: str | Path | None = None) -> int:
-    """Develop a set of frames with darktable-cli, in the style of ``style_sidecar``."""
+            root: str | Path | None = None,
+            conn: sqlite3.Connection | None = None) -> int:
+    """Develop a set of frames with darktable-cli, in the style of ``style_sidecar``.
+
+    Frames and crops go through the shared task-11/12 functions
+    (``representative_frame`` for the frame to develop, ``get_box`` for the
+    crop) so an owner's fixed crop or chosen photo is what gets developed, and
+    each edit gets a watermarked ``share/`` copy alongside the clean master.
+    """
     if style_sidecar is None:
         raise SystemExit("error: a style sidecar is required "
                          "(--style-sidecar, an edited .xmp)")
     home = lifer_home()
     source = Path(source_folder).expanduser()
     folder = effective_trip_id(source, root)
+    conn = conn or open_db()
     run_dir = home / "runs" / folder
     cache_dir = home / "cache" / folder
     src_dir = home / "develop" / folder / "src"
     out_dir = home / "edits" / folder
     before_dir = out_dir / "before"
     xmp_dir = out_dir / "xmp"
-    for d in (src_dir, out_dir, before_dir, xmp_dir):
+    share_dir = out_dir / "share"
+    for d in (src_dir, out_dir, before_dir, xmp_dir, share_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     csv_path = run_dir / "candidates.csv"
@@ -507,7 +527,8 @@ def develop(source_folder: str, species: str = "", n: int = 5,
                 raise SystemExit(f"error: frame '{name}' not found in {cache_dir}")
         selected = list(frames)
     else:
-        selected = _pick_frame_names(candidates, cache_dir, species, n)
+        selected = _pick_frame_names(candidates, cache_dir, species, n,
+                                     folder=folder, conn=conn)
         if not selected:
             raise SystemExit(f"error: no sharp frames of '{species}' found in {folder}")
         print(f"selected {len(selected)} frame(s): {', '.join(selected)}")
@@ -523,10 +544,11 @@ def develop(source_folder: str, species: str = "", n: int = 5,
             shutil.copy2(source / name, src_nef)
 
         data = _cache_frame(cache_dir, name) or {}
-        box = _best_box(data.get("dets", []))
-        if box is None:
+        det_box = get_box(folder, name, conn, dets=data.get("dets", []))
+        if det_box is None:
             print(f"skip {name}: no detection")
             continue
+        box = Box(det_box.x1, det_box.y1, det_box.x2, det_box.y2)
 
         iso = _read_iso(src_nef)
         before_full = _extract_jpeg(src_nef)
@@ -547,6 +569,15 @@ def develop(source_folder: str, species: str = "", n: int = 5,
         jpg_path = out_dir / f"{stem}.jpg"
         after.convert("RGB").save(jpg_path, "JPEG", quality=JPEG_Q)
         full.unlink(missing_ok=True)
+
+        # watermarked share copy beside the clean master (task 14): the same
+        # edit, but with the owner's mark placed to keep it off the bird.
+        bird = map_box((box.x1, box.y1, box.x2, box.y2),
+                       (crop.x1, crop.y1, crop.x2, crop.y2),
+                       after.width, after.height)
+        share_img = apply_watermark(after, bird, Watermark.from_config())
+        share_path = share_dir / f"{stem}.jpg"
+        share_img.save(share_path, "JPEG", quality=JPEG_Q)
 
         before = _resize_long_edge(_fractional_crop(before_full, frac), LONG_EDGE)
         before_path = before_dir / f"{stem}.jpg"

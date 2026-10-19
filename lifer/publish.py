@@ -28,6 +28,7 @@ from PIL import Image
 from .boxes import get_box, representative_frame
 from .extract import load_photo
 from .home import lifer_home, source_folder_for_trip
+from .watermark import Watermark, apply_watermark, map_box
 from .web import (_init_db, aves_taxa, build_sightings, _summarize)
 
 # Source photos live on the read-only BIRDING share (wherever the run's
@@ -57,18 +58,20 @@ def _edited(folder: str, frame: str) -> Path | None:
     return None
 
 
-def _crop_breathing(image: Image.Image, det) -> Image.Image:
+def _crop_breathing(image: Image.Image, det) -> tuple[Image.Image, tuple[int, int, int, int] | None]:
     """Crop around the detection so the bird is ~1/3 of the crop width.
 
     The crop is 3:2 (landscape) and centred on the bird, then clamped to the
     frame. A 3:2 sensor is already landscape, so a full-frame clamp keeps the
-    ratio; a taller-than-wide bird only widens the crop.
+    ratio; a taller-than-wide bird only widens the crop. Returns the cropped
+    image and the crop rectangle in full-frame pixel coords (None if it could
+    not be computed), so callers can map the bird box through it.
     """
     W, H = image.size
     x1, y1, x2, y2 = float(det.x1), float(det.y1), float(det.x2), float(det.y2)
     w, h = x2 - x1, y2 - y1
     if w <= 0 or h <= 0:
-        return image
+        return image, None
 
     cw = 3.0 * w                      # bird is ~1/3 of the width
     cw = max(cw, 1.5 * h)             # keep the whole bird in frame vertically
@@ -83,7 +86,7 @@ def _crop_breathing(image: Image.Image, det) -> Image.Image:
 
     box = (int(round(x0)), int(round(y0)),
            int(round(x0 + cw)), int(round(y0 + ch)))
-    return image.crop(box)
+    return image.crop(box), box
 
 
 def _downscale(image: Image.Image, long_edge: int) -> Image.Image:
@@ -118,6 +121,8 @@ def _render_photo(enc: dict[str, Any], out_full: Path, out_thumb: Path, conn) ->
     frame = representative_frame(conn, folder,
                                  enc.get("frames") or [], enc["best_frame"])
     edited = _edited(folder, frame)
+    bird = None
+    crop: tuple[int, int, int, int] | None = None
     if edited is not None:
         try:
             image = Image.open(edited).convert("RGB")
@@ -135,9 +140,18 @@ def _render_photo(enc: dict[str, Any], out_full: Path, out_thumb: Path, conn) ->
         box = get_box(folder, frame, conn)
         if box is None:
             return False
-        image = _crop_breathing(image, box)
+        image, crop = _crop_breathing(image, box)
+        # The owner's mark is placed to stay off the bird: map the bird box
+        # (task 11/12, `get_box`) through the crop into the output image.
+        if crop is not None:
+            bird = (box.x1, box.y1, box.x2, box.y2)
 
-    _save_jpeg(_downscale(image, LONG_EDGE), out_full, JPEG_Q)
+    full_img = _downscale(image, LONG_EDGE)
+    if crop is not None and bird is not None:
+        bird = map_box(bird, crop, full_img.width, full_img.height)
+    # Task 14: site photos carry the owner's mark; thumbnails (<=400px) do not.
+    full_img = apply_watermark(full_img, bird, Watermark.from_config())
+    _save_jpeg(full_img, out_full, JPEG_Q)
     _save_jpeg(_downscale(image, THUMB_EDGE), out_thumb, THUMB_Q)
     return True
 
