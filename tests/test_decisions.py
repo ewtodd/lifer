@@ -320,8 +320,62 @@ def test_web_sightings_resolve_by_frames(app_client):
     rows = client.get("/api/lifelist").get_json()
     row = next(r for r in rows if r["common"].lower() == "sparrow")
     assert row["count"] >= 1
-    # the confirmed sighting attaches to the current encounter of the trip
-    assert row["thumb"] == "/media/TRIP/crops/enc_0001.jpg"
+    # the confirmed sighting attaches to the current encounter of the trip,
+    # and its thumb is the representative frame's per-frame crop (task 12)
+    assert row["thumb"] == "/media/TRIP/crops/frames/_DSC0002.NEF.jpg"
+
+
+def test_representative_frame_prefers_choice():
+    import sqlite3
+    from lifer.boxes import representative_frame, set_frame_choice
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE frame_choice (folder TEXT NOT NULL, frames TEXT NOT NULL,"
+        " chosen TEXT NOT NULL, updated_at TEXT NOT NULL,"
+        " PRIMARY KEY (folder, frames))")
+    frames = ["_DSC0001.NEF", "_DSC0002.NEF"]
+    # default: the pipeline's best frame
+    assert representative_frame(conn, "TRIP", frames, "_DSC0002.NEF") == "_DSC0002.NEF"
+    # an owner choice wins over the best frame
+    set_frame_choice(conn, "TRIP", frames, "_DSC0001.NEF")
+    assert representative_frame(conn, "TRIP", frames, "_DSC0002.NEF") == "_DSC0001.NEF"
+    # the choice is keyed by (folder, frame set), order-insensitive
+    assert representative_frame(conn, "TRIP", ["_DSC0002.NEF", "_DSC0001.NEF"],
+                                "_DSC0002.NEF") == "_DSC0001.NEF"
+    # a chosen frame no longer in the encounter falls back to the best frame
+    assert representative_frame(conn, "TRIP", ["_DSC0001.NEF", "_DSC0003.NEF"],
+                                "_DSC0003.NEF") == "_DSC0003.NEF"
+    conn.close()
+
+
+def test_web_pick_representative_frame(app_client):
+    client, db = app_client
+    # enc_0001's pipeline best is _DSC0002.NEF; the owner picks _DSC0001.NEF
+    r = client.post("/api/frame", json={
+        "folder": "TRIP", "enc_id": "enc_0001", "frame": "_DSC0001.NEF"})
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()["chosen_frame"] == "_DSC0001.NEF"
+    data = client.get("/api/trip/TRIP").get_json()
+    enc = data["groups"][0]["encs"][0]
+    assert enc["best_frame"] == "_DSC0002.NEF"          # pipeline best unchanged
+    assert enc["repr_frame"] == "_DSC0001.NEF"          # the chosen photo wins
+    assert enc["chosen_frame"] == "_DSC0001.NEF"
+    # frames are sorted sharpest-first; _DSC0002 (1686.6) then _DSC0001 (1685.9)
+    assert [f["name"] for f in enc["frames"]] == ["_DSC0002.NEF", "_DSC0001.NEF"]
+    assert enc["frames"][1]["chosen"] is True
+    # the card crop is the chosen frame's per-frame crop
+    assert enc["crop"].endswith("/crops/frames/_DSC0001.NEF.jpg")
+    # restarting over the same DB keeps the choice
+    app2 = web.create_app(db)
+    app2.config["TESTING"] = True
+    client2 = app2.test_client()
+    enc2 = client2.get("/api/trip/TRIP").get_json()["groups"][0]["encs"][0]
+    assert enc2["repr_frame"] == "_DSC0001.NEF"
+    # a frame that is not one of the encounter's frames is rejected
+    r2 = client.post("/api/frame", json={
+        "folder": "TRIP", "enc_id": "enc_0001", "frame": "_DSC9999.NEF"})
+    assert r2.status_code == 400
 
 
 def test_web_decision_post_stores_frames(app_client):

@@ -29,8 +29,10 @@ from PIL import Image
 from rapidfuzz import fuzz, process
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from .boxes import (Box, clear_override, get_box, get_override, get_reid,
-                    get_snapshot, set_override, to_list)
+from .boxes import (Box, clear_override, get_box, get_frame_choice,
+                    get_override, get_reid, get_snapshot,
+                    representative_frame, set_frame_choice, set_override,
+                    to_list)
 from .decisions import (EncRef, current_encounters, ensure_frames_column,
                         parse_frames, resolve_decision)
 from .extract import load_photo
@@ -89,6 +91,13 @@ CREATE TABLE IF NOT EXISTS crop_boxes (
   snapshot TEXT NOT NULL DEFAULT '',   -- JSON: original candidate fields (for Undo)
   updated_at TEXT NOT NULL,
   PRIMARY KEY (folder, frame)
+);
+CREATE TABLE IF NOT EXISTS frame_choice (
+  folder TEXT NOT NULL,
+  frames TEXT NOT NULL,     -- JSON: the encounter's frame set (sorted)
+  chosen TEXT NOT NULL,     -- the representative frame the owner picked (task 12)
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (folder, frames)
 );
 """
 
@@ -442,7 +451,7 @@ def _enc_refs(folder: str, cands: list[dict[str, Any]],
 
 def _attach_decisions(folder: str, cands: list[dict[str, Any]],
                       nodet: list[dict[str, Any]],
-                      decs: dict[tuple[str, str], dict[str, Any]]) -> None:
+                      decs: dict[tuple[str, str], dict[str, Any]]) -> list[EncRef]:
     """Attach each decision to the current encounter it resolves to (task 25).
 
     Frame overlap beats the stored (enc_id, best_frame) key, which is only a
@@ -450,7 +459,9 @@ def _attach_decisions(folder: str, cands: list[dict[str, Any]],
     same bird may be the same enc_id with a different best frame, or a
     different enc_id at all. Legacy decisions without a frame list fall back
     to the exact-key match (their best frame being in the encounter's frames).
-    """
+
+    Returns the resolved encounter references (so callers can rebuild the
+    frame lists for old runs, task 12)."""
     refs = _enc_refs(folder, cands, nodet)
     by_id: dict[str, dict[str, Any]] = {}
     for d in decs.values():
@@ -462,6 +473,7 @@ def _attach_decisions(folder: str, cands: list[dict[str, Any]],
     for n in nodet:
         if n.get("enc_id"):
             n["decision"] = by_id.get(n["enc_id"])
+    return refs
 
 
 def _badges(c: dict) -> list[str]:
@@ -485,12 +497,54 @@ def _group_section(encs: list[dict]) -> str:
     return "other"
 
 
+def _frame_views(folder: str, frames: list[str], best_frame: str,
+                 repr_frame: str, conn: sqlite3.Connection | None) -> list[dict]:
+    """Per-frame views for an encounter's frame strip + lightbox (task 12).
+
+    Best (sharpest) frame first; each frame carries its crop / full-frame
+    preview / box-less source URLs, and whether a usable detection box exists
+    (frames without one still appear, tagged `has_box` False for a "no box"
+    label and an available fix-crop)."""
+    out: list[dict] = []
+    for f in frames:
+        cache = _frame_cache(folder, f) or {}
+        dets = cache.get("dets") or []
+        override = get_override(conn, folder, f) if conn is not None else None
+        has_box = bool(dets) or override is not None
+        sharp = float(cache.get("sharpness", -1.0))
+        out.append({
+            "name": f,
+            "sharp": round(sharp, 1) if sharp > 0 else 0,
+            "has_box": has_box,
+            "best": f == best_frame,
+            "chosen": f == repr_frame,
+            "crop": (f"/media/{folder}/crops/frames/{f}.jpg" if has_box
+                     else f"/media/{folder}/frames/frames/{f}.jpg"),
+            "frame": f"/media/{folder}/frames/frames/{f}.jpg",
+            "src": f"/media/{folder}/frames/src/frames/{f}.jpg",
+            "override": to_list(override) if override else None,
+        })
+    out.sort(key=lambda v: (-v["sharp"], v["name"]))
+    return out
+
+
 def _enc_view(folder: str, c: dict, decision: dict | None,
-              conn: sqlite3.Connection | None = None) -> dict:
+              conn: sqlite3.Connection | None = None,
+              frames: list[str] | None = None) -> dict:
     top1 = c["adj_top3"][0]
-    frame = c["best_frame"]
-    override = get_override(conn, folder, frame) if conn is not None else None
-    reid = get_reid(conn, folder, frame) if conn is not None else None
+    # The encounter's frames (task 12): candidates.csv carries them on new
+    # runs; old runs get them rebuilt by _enc_refs, and we always fall back to
+    # the pipeline-best frame so there is at least one.
+    frames = list(frames) if frames else list(c.get("frames") or [])
+    if not frames:
+        frames = [c["best_frame"]]
+    repr_frame = (representative_frame(conn, folder, frames, c["best_frame"])
+                  if conn is not None else c["best_frame"])
+    fviews = _frame_views(folder, frames, c["best_frame"], repr_frame, conn)
+    repr_i = next((i for i, fv in enumerate(fviews) if fv["name"] == repr_frame), 0)
+    override = get_override(conn, folder, repr_frame) if conn is not None else None
+    reid = get_reid(conn, folder, repr_frame) if conn is not None else None
+    chosen = get_frame_choice(conn, folder, frames) if conn is not None else None
     return {
         "id": c["enc_id"],
         "species": top1[0],
@@ -500,12 +554,17 @@ def _enc_view(folder: str, c: dict, decision: dict | None,
         "n_frames": c["n_frames"],
         "best_frame": c["best_frame"],
         "det_conf": c["det_conf"],
-        "crop": f"/media/{folder}/crops/{c['enc_id']}.jpg",
-        "frame": f"/media/{folder}/frames/{c['enc_id']}.jpg",
-        "src": f"/media/{folder}/frames/src/{c['enc_id']}.jpg",
+        "crop": fviews[repr_i]["crop"],
+        "frame": fviews[repr_i]["frame"],
+        "src": fviews[repr_i]["src"],
         "override": to_list(override) if override else None,
         "has_override": override is not None,
         "reid": reid,
+        "frames": fviews,
+        "repr_frame": repr_frame,
+        "repr_i": repr_i,
+        "chosen_frame": chosen,
+        "has_box": fviews[repr_i]["has_box"],
         "badges": _badges(c),
         "rare_evidence": c.get("rare_evidence", ""),
         "adj_top3": [list(x) for x in c["adj_top3"]],
@@ -520,7 +579,11 @@ def build_trip(folder: str, conn: sqlite3.Connection) -> dict:
     cands = load_candidates(folder)
     nodet_raw = load_nodet(folder)
     decs = _decisions_for(conn, folder)
-    _attach_decisions(folder, cands, nodet_raw, decs)
+    refs = _attach_decisions(folder, cands, nodet_raw, decs)
+    # Old runs lack a frames column in candidates.csv; _enc_refs rebuilds the
+    # frame lists from the cache, so pass them through to the encounter views
+    # (task 12: the strip + lightbox step through every frame).
+    frames_by_enc = {r.enc_id: list(r.frames) for r in refs}
 
     # group by adjusted top-1 (the species the pipeline is showing)
     by_species: dict[str, list[dict]] = {}
@@ -531,7 +594,9 @@ def build_trip(folder: str, conn: sqlite3.Connection) -> dict:
     groups: list[dict] = []
     for key, encs in by_species.items():
         encs.sort(key=lambda e: e["time_start"])
-        views = [_enc_view(folder, c, c["decision"], conn) for c in encs]
+        views = [_enc_view(folder, c, c["decision"], conn,
+                           frames_by_enc.get(c["enc_id"], c.get("frames")))
+                 for c in encs]
         top1 = encs[0]["adj_top3"][0]
         best = max(views, key=lambda v: v["det_conf"])
         badges: list[str] = []
@@ -735,15 +800,86 @@ def _crop_square(image, box: Box, margin: float = 0.20):
     return image.crop(crop)
 
 
+def _frame_crop_path(folder: str, frame: str) -> Path:
+    return RUNS / folder / "crops" / "frames" / f"{frame}.jpg"
+
+
+def _frame_preview_path(folder: str, frame: str) -> Path:
+    return RUNS / folder / "frames" / "frames" / f"{frame}.jpg"
+
+
+def _frame_src_path(folder: str, frame: str) -> Path:
+    return RUNS / folder / "frames" / "src" / "frames" / f"{frame}.jpg"
+
+
+def _per_frame_crop(folder: str, frame: str, conn: sqlite3.Connection) -> Path | None:
+    """Square crop for one frame, generated on first request (cached under
+    runs/). Frames with no usable box fall back to the box-less full preview."""
+    dst = _frame_crop_path(folder, frame)
+    if dst.is_file():
+        return dst
+    box = get_box(folder, frame, conn)
+    if box is None:
+        return _per_frame_preview(folder, frame, conn)
+    photo = source_folder_for_trip(folder) / frame
+    if not photo.is_file():
+        return None
+    try:
+        image = load_photo(photo)
+        save_crop(_crop_square(image, box), dst)
+    except (RuntimeError, OSError):
+        return None
+    return dst
+
+
+def _per_frame_preview(folder: str, frame: str, conn: sqlite3.Connection) -> Path | None:
+    """Downscaled full frame with the box drawn (box-less if no detection)."""
+    dst = _frame_preview_path(folder, frame)
+    if dst.is_file():
+        return dst
+    box = get_box(folder, frame, conn)
+    photo = source_folder_for_trip(folder) / frame
+    if not photo.is_file():
+        return None
+    try:
+        image = load_photo(photo)
+        save_frame_preview(image, box, dst)
+    except (RuntimeError, OSError):
+        return None
+    return dst
+
+
+def _per_frame_src(folder: str, frame: str) -> Path | None:
+    """Box-less full-frame preview for the crop editor, generated on demand."""
+    dst = _frame_src_path(folder, frame)
+    if dst.is_file():
+        return dst
+    photo = source_folder_for_trip(folder) / frame
+    if not photo.is_file():
+        return None
+    try:
+        image = load_photo(photo)
+        save_frame_preview(image, None, dst)
+    except (RuntimeError, OSError):
+        return None
+    return dst
+
+
 def _regenerate_crop(folder: str, enc_id: str, frame: str,
                      box: Box) -> Image.Image:
-    """Regenerate the review app's crop + frame preview + box-less source
-    preview from the full-size source image. Returns the crop PIL image."""
+    """Regenerate a frame's per-frame assets (task 12: the crop / box preview /
+    box-less source used by the frame strip and lightbox) plus the encounter's
+    top-level crop + preview (kept for the pipeline's static review.html and
+    legacy callers). Returns the crop image."""
     photo = source_folder_for_trip(folder) / frame
     if not photo.is_file():
         raise FileNotFoundError(f"missing photo: {photo}")
     image = load_photo(photo)
     crop = _crop_square(image, box)
+    save_crop(crop, _frame_crop_path(folder, frame))
+    save_frame_preview(image, box, _frame_preview_path(folder, frame))
+    save_frame_preview(image, None, _frame_src_path(folder, frame))
+    # Encounter-level files (back-compat + static review.html).
     save_crop(crop, RUNS / folder / "crops" / f"{enc_id}.jpg")
     save_frame_preview(image, box, RUNS / folder / "frames" / f"{enc_id}.jpg")
     save_frame_preview(image, None, RUNS / folder / "frames" / "src" / f"{enc_id}.jpg")
@@ -829,11 +965,19 @@ def _ensure_src_preview(folder: str, enc_id: str) -> Path | None:
     return dst
 
 
-def _sighting_view(s: dict) -> str | None:
-    """Thumb URL for a sighting, or None for ODS rows (no photo)."""
+def _sighting_view(s: dict, conn: sqlite3.Connection) -> str | None:
+    """Thumb URL for a sighting, or None for ODS rows (no photo).
+
+    Uses the sighting's representative frame (task 12): the owner-chosen photo
+    for the encounter if one is stored, else the pipeline's best frame, so the
+    lifelist thumb agrees with the review card and `publish`."""
     if s["enc"] is None:
         return None
-    return f"/media/{s['folder']}/crops/{s['enc']['enc_id']}.jpg"
+    folder = s["folder"]
+    enc = s["enc"]
+    frame = representative_frame(conn, folder,
+                                 enc.get("frames") or [], enc["best_frame"])
+    return f"/media/{folder}/crops/frames/{frame}.jpg"
 
 
 def build_sightings(conn: sqlite3.Connection) -> dict[str, dict]:
@@ -920,6 +1064,9 @@ def build_sightings(conn: sqlite3.Connection) -> dict[str, dict]:
             continue
         enc = dict(next(c for c in cands if c["enc_id"] == enc_ref.enc_id))
         enc["folder"] = folder
+        # task 12: carry the encounter's frame set so representative_frame can
+        # honour an owner-chosen photo for the card / thumb / publish.
+        enc["frames"] = list(enc_ref.frames) or list(enc.get("frames") or [])
         by_key_folder.setdefault((species.lower(), folder), []).append(enc)
 
     for (key, folder), encs in by_key_folder.items():
@@ -993,9 +1140,9 @@ def build_lifelist(conn: sqlite3.Connection, sort: str = "taxon") -> list[dict]:
             "latest_photo_date": latest_photo["date"] if latest_photo else None,
             "count": len(rec["sightings"]),
             "new": not any(x["source"] == "ods" for x in rec["sightings"]),
-            "thumb": _sighting_view(latest_photo) if latest_photo else None,
+            "thumb": _sighting_view(latest_photo, conn) if latest_photo else None,
             "sightings": [
-                {"date": x["date"], "place": x["place"], "thumb": _sighting_view(x)}
+                {"date": x["date"], "place": x["place"], "thumb": _sighting_view(x, conn)}
                 for x in rec["sightings"]
             ],
             "_rank": rank.get(rec["taxon_id"]) if rec["taxon_id"] is not None else None,
@@ -1063,6 +1210,25 @@ def create_app(db_path: Path) -> Flask:
 
     @app.route("/media/<folder>/<path:rel>")
     def media(folder: str, rel: str):
+        # Per-frame assets (task 12): the frame strip + lightbox show every
+        # frame of an encounter, so the crop / box preview / box-less source
+        # are generated on first request and cached under runs/. The nested
+        # "frames/" segment must be matched before the enc-level source prefix.
+        if rel.startswith("crops/frames/") and rel.endswith(".jpg"):
+            p = _per_frame_crop(folder, rel[len("crops/frames/"):-4], g.db)
+            if p is None:
+                abort(404)
+            return send_file(p)
+        if rel.startswith("frames/frames/") and rel.endswith(".jpg"):
+            p = _per_frame_preview(folder, rel[len("frames/frames/"):-4], g.db)
+            if p is None:
+                abort(404)
+            return send_file(p)
+        if rel.startswith("frames/src/frames/") and rel.endswith(".jpg"):
+            p = _per_frame_src(folder, rel[len("frames/src/frames/"):-4])
+            if p is None:
+                abort(404)
+            return send_file(p)
         # The crop editor wants a box-less full-frame preview; generate it from
         # the full-size embedded JPEG the first time (cached) so later loads are
         # instant. The blob lives under runs/ so it is never written to BIRDING.
@@ -1165,14 +1331,16 @@ def create_app(db_path: Path) -> Flask:
 
     @app.route("/api/cropboxes")
     def api_cropboxes():
-        """Boxes + frame size + current override for the crop editor of one
-        encounter's best frame (full-pixel coordinates)."""
+        """Boxes + frame size + current override for the crop editor.
+        Defaults to the encounter's best frame, but the shown frame (task 12)
+        can be named with `frame`, so fix-crop works on whichever frame the
+        lightbox is on (including a no-detection frame)."""
         folder = request.args.get("folder") or ""
         enc_id = request.args.get("enc_id") or ""
         c = _find_candidate(folder, enc_id)
         if c is None:
             return jsonify(ok=False, error="unknown encounter"), 404
-        frame = c["best_frame"]
+        frame = request.args.get("frame") or c["best_frame"]
         cache = _frame_cache(folder, frame) or {}
         dets = cache.get("dets") or []
         try:
@@ -1183,12 +1351,38 @@ def create_app(db_path: Path) -> Flask:
         return jsonify(ok=True, frame=frame, w=W, h=H,
                        boxes=[[float(x) for x in d] for d in dets],
                        override=to_list(override) if override else None,
-                       src=f"/media/{folder}/frames/src/{enc_id}.jpg")
+                       src=f"/media/{folder}/frames/src/frames/{frame}.jpg")
+
+    @app.route("/api/frame", methods=["POST"])
+    def api_frame():
+        """Pick the representative photo for an encounter (task 12). The choice
+        is keyed by (folder, the encounter's frame set) so a re-run keeps it;
+        every consumer reads it through `representative_frame`."""
+        p = request.get_json(force=True) or {}
+        folder = p.get("folder") or ""
+        enc_id = p.get("enc_id") or ""
+        frame = p.get("frame") or ""
+        c = _find_candidate(folder, enc_id)
+        if c is None:
+            return jsonify(ok=False, error="unknown encounter"), 404
+        enc_frames = list(c.get("frames") or [])
+        if not enc_frames:
+            # old runs: rebuild the frame list from the cache (same as _enc_refs)
+            refs = _enc_refs(folder, load_candidates(folder), load_nodet(folder))
+            enc_frames = next((list(r.frames) for r in refs if r.enc_id == enc_id),
+                              [c["best_frame"]])
+        if not enc_frames:
+            enc_frames = [c["best_frame"]]
+        if not frame or frame not in enc_frames:
+            return jsonify(ok=False, error=f"{frame!r} is not one of this encounter's frames"), 400
+        set_frame_choice(g.db, folder, enc_frames, frame)
+        return jsonify(ok=True, chosen_frame=frame, frames=sorted(enc_frames))
 
     @app.route("/api/crop", methods=["POST"])
     def api_crop():
-        """Set/clear a crop override for one encounter's best frame, regenerate
-        its card crop + previews, and re-identify the new crop (CPU-only)."""
+        """Set/clear a crop override for a frame (default: the best frame, but
+        `frame` may name the shown one), regenerate its card crop + previews,
+        and re-identify the new crop (CPU-only)."""
         p = request.get_json(force=True) or {}
         folder = p.get("folder") or ""
         enc_id = p.get("enc_id") or ""
@@ -1197,7 +1391,7 @@ def create_app(db_path: Path) -> Flask:
         c = _find_candidate(folder, enc_id)
         if c is None or not (RUNS / folder / "candidates.csv").is_file():
             return jsonify(ok=False, error="unknown encounter"), 400
-        frame = c["best_frame"]
+        frame = p.get("frame") or c["best_frame"]
         old_top1 = c.get("top1") or (c["adj_top3"][0][0] if c["adj_top3"] else "")
         if undo:
             snapshot = get_snapshot(g.db, folder, frame)
@@ -1219,8 +1413,8 @@ def create_app(db_path: Path) -> Flask:
             if snapshot:
                 _restore_snapshot(snapshot, folder, enc_id)
             return jsonify(ok=True, overridden=False, undo=True,
-                           crop=f"/media/{folder}/crops/{enc_id}.jpg",
-                           frame=f"/media/{folder}/frames/{enc_id}.jpg")
+                           crop=f"/media/{folder}/crops/frames/{frame}.jpg",
+                           frame=f"/media/{folder}/frames/frames/{frame}.jpg")
         if not isinstance(box_in, (list, tuple)) or len(box_in) != 4:
             return jsonify(ok=False, error="box must be [x1,y1,x2,y2]"), 400
         try:
@@ -1272,8 +1466,8 @@ def create_app(db_path: Path) -> Flask:
         return jsonify(ok=True, overridden=True,
                        reid=reid_info,
                        elapsed=fields["elapsed"],
-                       crop=f"/media/{folder}/crops/{enc_id}.jpg",
-                       frame=f"/media/{folder}/frames/{enc_id}.jpg",
+                       crop=f"/media/{folder}/crops/frames/{frame}.jpg",
+                       frame=f"/media/{folder}/frames/frames/{frame}.jpg",
                        adj_top3=[[n, s, p] for n, s, p in fields["adj_top3"]])
 
     @app.route("/api/lifelist")

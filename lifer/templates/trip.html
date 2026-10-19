@@ -17,6 +17,22 @@
 .ce-btns { display:flex; gap:8px; padding:10px; }
 .badge.reid { background:#2b8a3e; color:#eaffea; }
 .ce-zoom { position:absolute; right:8px; bottom:8px; color:#8aa; font-size:12px; }
+/* task 12: per-frame strip in the expanded encounter */
+.enc-frames { display:flex; gap:6px; margin-top:10px; flex-wrap:wrap; }
+.enc-frame { position:relative; margin:0; }
+.enc-frame img { display:block; width:96px; height:72px; object-fit:cover;
+     border:1px solid var(--border); border-radius:3px; cursor:pointer; }
+.enc-frame.chosen img { outline:3px solid var(--bar); }
+.enc-frame.best img { outline:1px solid rgba(255,255,255,.35); }
+.enc-frame.nbox img { opacity:.55; }
+.enc-frame figcaption { font-size:.62rem; font-family:ui-monospace,Menlo,monospace;
+     color:var(--muted); text-align:center; margin-top:1px; }
+.enc-frame.chosen figcaption { color:var(--bar); font-weight:700; }
+.enc-frame .fmark { position:absolute; left:2px; top:2px; background:#171a20;
+     color:#ffc400; font-size:.6rem; padding:0 3px; border-radius:2px; }
+.lb-fpos { font-size:.78rem; color:#9aa; text-align:center; margin-top:4px;
+     font-family:ui-monospace,Menlo,monospace; }
+.lb-meta.nbox { color:#f0a; }
 </style>
 </head>
 <body>
@@ -70,9 +86,10 @@
     <div class="g-encs" data-gencs="{{ gi }}" hidden>
       {% for e in grp.encs %}
       <div class="enc" data-encrow="{{ e.id }}">
-        <img class="enc-crop" src="{{ e.crop }}" loading="lazy" alt="{{ e.id }}" data-g="{{ gi }}" data-e="{{ loop.index0 }}">
+        {% set enc_i = loop.index0 %}
+        <img class="enc-crop" src="{{ e.crop }}" loading="lazy" alt="{{ e.id }}" data-g="{{ gi }}" data-e="{{ enc_i }}">
         <div class="enc-info">
-          <div class="enc-line">{{ e.time }} &middot; {{ e.n_frames }} frame{{ "s" if e.n_frames != 1 }} &middot; {{ e.best_frame }} &middot; det {{ "%.3f" | format(e.det_conf) }} <span class="enc-chip" data-chip="{{ e.id }}"></span>
+          <div class="enc-line">{{ e.time }} &middot; {{ e.n_frames }} frame{{ "s" if e.n_frames != 1 }} &middot; {{ e.repr_frame }} &middot; det {{ "%.3f" | format(e.det_conf) }} <span class="enc-chip" data-chip="{{ e.id }}"></span>
             {% if e.has_override %}<span class="badge rare" title="crop overridden">crop fixed</span>{% endif %}
             {% if e.reid %}<span class="badge reid">re-identified: {{ e.reid.old }} &rarr; {{ e.reid.new }}</span>{% endif %}
           </div>
@@ -97,6 +114,17 @@
             <input class="note-input" data-notein="{{ e.id }}" placeholder="note" value="{{ e.decision.note if e.decision else '' }}">
             <button class="btn sm" data-save-note="{{ e.id }}">Save note</button>
             <button class="btn sm" data-clear="{{ e.id }}" {% if not e.decision %}hidden{% endif %}>Undo</button>
+          </div>
+          <div class="enc-frames">
+            {% for f in e.frames %}
+            <figure class="enc-frame{% if f.chosen %} chosen{% endif %}{% if f.best %} best{% endif %}{% if not f.has_box %} nbox{% endif %}">
+              {% if f.chosen %}<span class="fmark">&#9733;</span>{% endif %}
+              <img src="{{ f.crop }}" loading="lazy" alt="{{ f.name }}"
+                   title="{{ f.name }} &middot; sharpness {{ f.sharp if f.sharp > 0 else 'n/a' }}"
+                   data-g="{{ gi }}" data-e="{{ enc_i }}" data-fi="{{ loop.index0 }}">
+              <figcaption>{% if f.sharp > 0 %}{{ f.sharp }}{% else %}no box{% endif %}</figcaption>
+            </figure>
+            {% endfor %}
           </div>
         </div>
       </div>
@@ -144,7 +172,10 @@
       <button class="btn" id="lb-save-note">Save note</button>
       <button class="btn" id="lb-clear" hidden>Undo</button>
       <button class="btn" id="lb-fixcrop">Fix crop</button>
-      <div class="lb-hint">C confirm &middot; U unsure &middot; X not identifiable &middot; N next undecided &middot; arrows browse group</div>
+      <button class="btn" id="lb-use">Use this photo</button>
+      <button class="btn" id="lb-enc-prev" title="Previous encounter" aria-label="Previous encounter">&#8249; enc</button>
+      <button class="btn" id="lb-enc-next" title="Next encounter" aria-label="Next encounter">enc &#8250;</button>
+      <div class="lb-hint">C confirm &middot; U unsure &middot; X not identifiable &middot; N next undecided &middot; &#8592;/&#8594; frames &middot; Shift+arrows encounter</div>
     </div>
   </div></div>
   <div class="ce" id="ce" hidden>
@@ -269,8 +300,13 @@ async function sendGroupAction(gi, action) {
 }
 
 // ---- lightbox ---------------------------------------------------------------
-function openLb(gi, ei) {
-  cur = { type: 'enc', gi: gi, ei: ei }; showCrop = false; savedScroll = window.scrollY;
+function openLb(gi, ei, fi) {
+  const e = encAt(gi, ei);
+  const n = (e.frames || []).length;
+  let f = 0;
+  if (fi != null && fi >= 0 && fi < n) f = fi;
+  else if (e.repr_i != null && e.repr_i < n) f = e.repr_i;
+  cur = { type: 'enc', gi: gi, ei: ei, fi: f }; showCrop = false; savedScroll = window.scrollY;
   renderLb();
   lb.classList.add('open'); lb.setAttribute('aria-hidden', 'false');
   document.body.style.overflow = 'hidden';
@@ -292,14 +328,42 @@ function nav(d) {
   let n = cur.ei + d;
   if (n < 0) n = encs.length - 1;
   if (n >= encs.length) n = 0;
-  cur.ei = n; showCrop = false; renderLb();
+  cur.ei = n;
+  const e = encs[n];
+  cur.fi = (e.frames || []).length > 1 ? (e.repr_i || 0) : 0;
+  showCrop = false; renderLb();
+}
+function navFrame(d) {
+  if (!cur || cur.type !== 'enc') return;
+  const n = (encAt(cur.gi, cur.ei).frames || []).length;
+  if (n < 2) return;
+  cur.fi = (cur.fi + d + n) % n;
+  showCrop = false; renderLb();
+}
+function refreshEncVisual(gi, ei) {
+  const g = document.querySelector('.group[data-g="' + gi + '"]');
+  if (!g) return;
+  const e = encAt(gi, ei);
+  const bestImg = g.querySelector('.g-head .g-best');
+  if (bestImg && +bestImg.dataset.e === ei) bestImg.src = e.crop;
+  g.querySelectorAll('.g-strip img, .enc-crop').forEach(function (img) {
+    if (+img.dataset.e === ei) img.src = e.crop;
+  });
+  g.querySelectorAll('.enc-frame').forEach(function (el, fi) {
+    const fe = (e.frames || [])[fi];
+    el.classList.toggle('chosen', !!(fe && fe.chosen));
+  });
 }
 function nextUndecided() {
   if (!cur || cur.type !== 'enc') return;
   const encs = DATA.groups[cur.gi].encs;
   for (let k = 1; k <= encs.length; k++) {
     const n = (cur.ei + k) % encs.length;
-    if (!encs[n].decision) { cur.ei = n; showCrop = false; renderLb(); return; }
+    if (!encs[n].decision) {
+      cur.ei = n;
+      cur.fi = (encs[n].frames || []).length > 1 ? (encs[n].repr_i || 0) : 0;
+      showCrop = false; renderLb(); return;
+    }
   }
 }
 function badgeHtml(b, e) {
@@ -336,9 +400,11 @@ function renderLb() {
   }
   actions.style.display = '';
   const e = encAt(cur.gi, cur.ei);
+  const frames = e.frames || [];
+  const f = frames[cur.fi] || e;
   $('lb-fixcrop').style.display = '';
-  $('lb-img').src = (showCrop && e.crop) ? e.crop : e.frame;
-  $('lb-toggle').style.display = (e.crop && e.frame) ? '' : 'none';
+  $('lb-img').src = (showCrop && f.crop) ? f.crop : f.frame;
+  $('lb-toggle').style.display = (f.has_box && f.crop && f.frame) ? '' : 'none';
   $('lb-toggle').textContent = showCrop ? 'Show full frame' : 'Show crop';
   let cap = '<div class="lb-title">' + esc(e.species);
   if (e.sci) cap += ' <span class="lb-sci">' + esc(e.sci) + '</span>';
@@ -351,9 +417,24 @@ function renderLb() {
   cap += '<div class="lb-line muted">Raw: ' + fmtTop3(e.raw_top3) + '</div>';
   cap += '<div class="lb-line" style="margin-top:8px">' + decChip(e) + '</div>';
   cap += '<div class="lb-meta">' + e.time + ' &middot; ' + e.n_frames +
-    ' frame' + (e.n_frames === 1 ? '' : 's') + ' &middot; ' + esc(e.best_frame) +
+    ' frame' + (e.n_frames === 1 ? '' : 's') + ' &middot; ' + esc(f.name || e.repr_frame) +
     ' &middot; det ' + Number(e.det_conf).toFixed(3) + '</div>';
+  if (frames.length > 1)
+    cap += '<div class="lb-fpos">frame ' + (cur.fi + 1) + ' of ' + frames.length +
+      (f.best ? ' &middot; pipeline best' : '') +
+      (f.chosen ? ' &middot; chosen' : '') +
+      (f.has_box ? '' : ' &middot; no box') + '</div>';
+  else if (!f.has_box)
+    cap += '<div class="lb-fpos">no detection box</div>';
   $('lb-caption').innerHTML = cap;
+  const useBtn = $('lb-use');
+  if (frames.length > 1) {
+    useBtn.style.display = '';
+    useBtn.disabled = (f.name === e.chosen_frame);
+    useBtn.textContent = (f.name === e.chosen_frame) ? 'Chosen &#10003;' : 'Use this photo';
+  } else {
+    useBtn.style.display = 'none';
+  }
   $('lb-note').value = e.decision ? (e.decision.note || '') : '';
   $('lb-clear').hidden = !e.decision;
   $('lb-spec').value = '';
@@ -396,6 +477,8 @@ function attachAutocomplete(input, listDiv, onPick) {
 document.addEventListener('click', function (e2) {
   const best = e2.target.closest('.g-best, .g-strip img, .enc-crop');
   if (best) { openLb(+best.dataset.g, +best.dataset.e); return; }
+  const fr = e2.target.closest('.enc-frame img');
+  if (fr) { openLb(+fr.dataset.g, +fr.dataset.e, +fr.dataset.fi); return; }
   const nd = e2.target.closest('.nodet');
   if (nd) { openNodet(+nd.dataset.idx); return; }
   const ex = e2.target.closest('[data-expand]');
@@ -457,8 +540,27 @@ function encAtByEncId(id) {
   return null;
 }
 document.getElementById('lb-close').addEventListener('click', closeLb);
-document.getElementById('lb-prev').addEventListener('click', function () { nav(-1); });
-document.getElementById('lb-next').addEventListener('click', function () { nav(1); });
+document.getElementById('lb-prev').addEventListener('click', function () { navFrame(-1); });
+document.getElementById('lb-next').addEventListener('click', function () { navFrame(1); });
+document.getElementById('lb-enc-prev').addEventListener('click', function () { nav(-1); });
+document.getElementById('lb-enc-next').addEventListener('click', function () { nav(1); });
+document.getElementById('lb-use').addEventListener('click', async function () {
+  if (!cur || cur.type !== 'enc') return;
+  const e = encAt(cur.gi, cur.ei);
+  const f = (e.frames || [])[cur.fi];
+  if (!f) return;
+  const r = await fetch('/api/frame', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder: FOLDER, enc_id: e.id, frame: f.name })
+  });
+  const j = await r.json().catch(function () { return {}; });
+  if (!r.ok || !j.ok) { alert('Use photo failed: ' + (j.error || r.status)); return; }
+  e.chosen_frame = f.name; e.repr_frame = f.name; e.repr_i = cur.fi;
+  (e.frames || []).forEach(function (x) { x.chosen = (x.name === f.name); });
+  e.crop = f.crop; e.frame = f.frame; e.src = f.src;
+  renderLb();
+  refreshEncVisual(cur.gi, cur.ei);
+});
 document.getElementById('lb-toggle').addEventListener('click', function () {
   if (cur && cur.type === 'enc') { showCrop = !showCrop; renderLb(); }
 });
@@ -554,8 +656,12 @@ function ceDraw() {
 async function openCrop() {
   if (!cur) return;
   let e = null;
-  if (cur.type === 'enc') e = encAt(cur.gi, cur.ei);
-  else if (cur.type === 'nodet') {
+  let fname = null;
+  if (cur.type === 'enc') {
+    e = encAt(cur.gi, cur.ei);
+    const f = (e.frames || [])[cur.fi];
+    if (f) fname = f.name;
+  } else if (cur.type === 'nodet') {
     const n = DATA.nodet[cur.idx];
     if (!n.enc) return;   // legacy per-frame thumbnail: no encounter to fix
     e = n;
@@ -565,9 +671,10 @@ async function openCrop() {
   $('ce-undo').hidden = true;
   $('ce-hint').textContent = 'Loading\u2026';
   let j;
+  const framep = fname ? '&frame=' + encodeURIComponent(fname) : '';
   try {
     const r = await fetch('/api/cropboxes?folder=' + encodeURIComponent(FOLDER) +
-      '&enc_id=' + encodeURIComponent(e.id));
+      '&enc_id=' + encodeURIComponent(e.id) + framep);
     j = await r.json().catch(function () { return {}; });
   } catch (_) { j = {}; }
   if (!j.ok) { alert('Could not load crop editor: ' + (j.error || 'unknown error')); closeCrop(); return; }
@@ -674,8 +781,8 @@ document.addEventListener('keydown', function (e3) {
   if (!lb.classList.contains('open')) return;
   if (e3.target.matches('input,textarea')) return;
   if (e3.key === 'Escape') closeLb();
-  else if (e3.key === 'ArrowLeft') nav(-1);
-  else if (e3.key === 'ArrowRight') nav(1);
+  else if (e3.key === 'ArrowLeft') (e3.shiftKey ? nav(-1) : navFrame(-1));
+  else if (e3.key === 'ArrowRight') (e3.shiftKey ? nav(1) : navFrame(1));
   else if (e3.key === 'c' || e3.key === 'C') $('lb-confirm').click();
   else if (e3.key === 'u' || e3.key === 'U') $('lb-unsure').click();
   else if (e3.key === 'x' || e3.key === 'X') $('lb-notbird').click();
@@ -683,8 +790,9 @@ document.addEventListener('keydown', function (e3) {
 });
 (function () {
   // #g=<group> expands the group; #g=<group>&e=<enc index> also opens the
-  // lightbox (deep links / screenshots)
-  const m = location.hash.match(/^#g=(\d+)(?:&e=(\d+))?$/);
+  // lightbox; &f=<frame index> steps to a specific frame (deep links /
+  // screenshots)
+  const m = location.hash.match(/^#g=(\d+)(?:&e=(\d+))?(?:&f=(\d+))?$/);
   if (m && DATA.groups[+m[1]]) {
     const gi = +m[1];
     const box = document.querySelector('[data-gencs="' + gi + '"]');
@@ -696,7 +804,8 @@ document.addEventListener('keydown', function (e3) {
     }
     if (m[2] !== undefined) {
       const ei = +m[2];
-      if (DATA.groups[gi].encs[ei]) openLb(gi, ei);
+      if (DATA.groups[gi].encs[ei])
+        openLb(gi, ei, m[3] !== undefined ? +m[3] : undefined);
     }
   }
   refreshDom();

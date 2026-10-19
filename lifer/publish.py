@@ -25,7 +25,7 @@ from typing import Any
 
 from PIL import Image
 
-from .boxes import get_box
+from .boxes import get_box, representative_frame
 from .extract import load_photo
 from .home import lifer_home, source_folder_for_trip
 from .web import (_init_db, aves_taxa, build_sightings, _summarize)
@@ -113,14 +113,18 @@ def _render_photo(enc: dict[str, Any], out_full: Path, out_thumb: Path, conn) ->
     if the source (edited file or NEF) is unusable so the caller can try the
     next-best encounter."""
     folder = enc["folder"]
-    edited = _edited(folder, enc["best_frame"])
+    # Task 12: an owner-chosen representative frame wins over the pipeline's
+    # best frame, so publish shows the same photo the owner picked in review.
+    frame = representative_frame(conn, folder,
+                                 enc.get("frames") or [], enc["best_frame"])
+    edited = _edited(folder, frame)
     if edited is not None:
         try:
             image = Image.open(edited).convert("RGB")
         except (OSError, ValueError):
             return False
     else:
-        photo = source_folder_for_trip(folder) / enc["best_frame"]
+        photo = source_folder_for_trip(folder) / frame
         if not photo.is_file():
             return False
         try:
@@ -128,7 +132,7 @@ def _render_photo(enc: dict[str, Any], out_full: Path, out_thumb: Path, conn) ->
         except (OSError, ValueError, RuntimeError):
             return False
         # Owner crop override wins; otherwise the detection box.
-        box = get_box(folder, enc["best_frame"], conn)
+        box = get_box(folder, frame, conn)
         if box is None:
             return False
         image = _crop_breathing(image, box)

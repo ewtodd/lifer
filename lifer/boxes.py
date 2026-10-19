@@ -48,6 +48,15 @@ def open_db(db_path: Path | None = None) -> sqlite3.Connection:
         " reid_old TEXT NOT NULL DEFAULT '', reid_new TEXT NOT NULL DEFAULT '', "
         " snapshot TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, "
         " PRIMARY KEY (folder, frame))")
+    # Owner-selected representative frames for an encounter (task 12), keyed by
+    # (folder, the encounter's frame set) so a re-run keeps the choice. The
+    # pipeline only reads crop_boxes, so this table is created lazily here and
+    # by the serve app's full SCHEMA.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS frame_choice ("
+        " folder TEXT NOT NULL, frames TEXT NOT NULL, "
+        " chosen TEXT NOT NULL, updated_at TEXT NOT NULL, "
+        " PRIMARY KEY (folder, frames))")
     conn.commit()
     return conn
 
@@ -177,3 +186,62 @@ def get_reid(conn: sqlite3.Connection, folder: str,
     if row is None or not (row["reid_old"] or row["reid_new"]):
         return None
     return {"old": row["reid_old"], "new": row["reid_new"]}
+
+
+# ---------------------------------------------------------------------------
+# Encounter representative frame (task 12)
+# ---------------------------------------------------------------------------
+#
+# An encounter is defined by its set of frames. The owner can pick any one of
+# them as the photo that represents the encounter; `representative_frame` is
+# the single shared look-up every consumer (review card, sighting/lifelist
+# thumb, `lifer publish`) goes through, next to `get_box`. The choice is keyed
+# by (folder, the encounter's frame set) so re-running the pipeline keeps it,
+# just like the crop-box overrides are keyed by (folder, frame).
+
+
+def frames_key(frames: list[str]) -> str:
+    """Canonical DB key for an encounter's frame set (order-independent)."""
+    return json.dumps(sorted(frames))
+
+
+def get_frame_choice(conn: sqlite3.Connection, folder: str,
+                     frames: list[str]) -> str | None:
+    """The owner-chosen representative frame for (folder, frames), or None."""
+    if not frames:
+        return None
+    row = conn.execute(
+        "SELECT chosen FROM frame_choice WHERE folder=? AND frames=?",
+        (folder, frames_key(frames))).fetchone()
+    return row["chosen"] if row else None
+
+
+def set_frame_choice(conn: sqlite3.Connection, folder: str,
+                     frames: list[str], chosen: str) -> None:
+    """Upsert the representative-frame choice for an encounter."""
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO frame_choice (folder, frames, chosen, updated_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(folder, frames) DO UPDATE SET "
+        "chosen=excluded.chosen, updated_at=excluded.updated_at",
+        (folder, frames_key(frames), chosen, now))
+    conn.commit()
+
+
+def clear_frame_choice(conn: sqlite3.Connection, folder: str,
+                       frames: list[str]) -> None:
+    conn.execute("DELETE FROM frame_choice WHERE folder=? AND frames=?",
+                 (folder, frames_key(frames)))
+    conn.commit()
+
+
+def representative_frame(conn: sqlite3.Connection, folder: str,
+                         frames: list[str], best_frame: str) -> str:
+    """The frame whose crop represents an encounter everywhere a 'best frame'
+    is chosen: the owner's pick (via ``set_frame_choice``) when it is still one
+    of the encounter's frames, otherwise the pipeline's best frame."""
+    if frames:
+        chosen = get_frame_choice(conn, folder, frames)
+        if chosen and chosen in frames:
+            return chosen
+    return best_frame
