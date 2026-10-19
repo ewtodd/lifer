@@ -126,6 +126,25 @@
           checks = {
             # building the package is itself a check
             inherit lifer;
+            # unit tests (pytest over tests/)
+            tests = pkgs.stdenvNoCC.mkDerivation {
+              pname = "lifer-tests";
+              version = "0.1.0";
+              src = ./.;
+              nativeBuildInputs = [ python pythonPackages.pytest ];
+              buildInputs = [ lifer ];
+              dontConfigure = true;
+              dontBuild = true;
+              doCheck = true;
+              # test-only derivation: give it an (empty) output so the
+              # pytest setup hook's $out-scanning phases have something to scan
+              installPhase = "mkdir -p $out";
+              checkPhase = ''
+                runHook preCheck
+                ${python}/bin/python -m pytest -q tests
+                runHook postCheck
+              '';
+            };
             # the home-manager module evaluates and produces the unit
             home-manager-module =
               let

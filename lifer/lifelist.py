@@ -39,6 +39,26 @@ def _cell_text(cell: TableCell) -> str:
     return "".join(parts).strip()
 
 
+def normalize_date(s: str) -> str:
+    """Normalise a LIFELIST.ods date: ``UK`` -> ``UNK``.
+
+    The ODS uses UNK for an unknown date (and ``x/UNK/xxxx`` when month+year
+    are known), but some rows were typed UK. Rewrite a standalone UK, or a UK
+    as a component of a slash-separated date (``7/UK/2021``), to UNK.
+    Case-insensitive and whole-component only: text that merely contains "uk"
+    is left alone.
+    """
+    s = (s or "").strip()
+    if not s:
+        return s
+    if s.lower() == "uk":
+        return "UNK"
+    if "/" in s:
+        return "/".join("UNK" if p.strip().lower() == "uk" else p
+                        for p in s.split("/"))
+    return s
+
+
 def parse_ods(path: Path) -> list[list[str]]:
     """Return the first four non-legend columns of the first sheet as rows."""
     doc = load(str(path))
@@ -62,17 +82,23 @@ def _find_header(rows: list[list[str]]) -> tuple[int, list[int]]:
             # map the four canonical columns by name, fall back to position
             idx = {name: head.index(name) for name in ("SPECIES", "DATE", "LOCATION", "DETAILS") if name in head}
             order = ["SPECIES", "DATE", "LOCATION", "DETAILS"]
-            return i, [idx.get(n, n_pos) for n, n_pos in enumerate(order)]
+            return i, [idx.get(name, pos) for pos, name in enumerate(order)]
     return 0, [0, 1, 2, 3]
 
 
 def parse_lifelist(path: Path) -> list[list[str]]:
-    """Rows as [species, date, location, details], header stripped."""
+    """Rows as [species, date, location, details], header stripped.
+
+    Dates are normalised (UK -> UNK) so every downstream consumer of the
+    import -- lifelist.csv, the review app, `lifer publish` -- sees UNK.
+    """
     rows = parse_ods(path)
     header_i, order = _find_header(rows)
     data = []
     for row in rows[header_i + 1:]:
-        data.append([row[i].strip() if i < len(row) else "" for i in order])
+        vals = [row[i].strip() if i < len(row) else "" for i in order]
+        vals[1] = normalize_date(vals[1])
+        data.append(vals)
     return data
 
 
