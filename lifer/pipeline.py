@@ -24,7 +24,8 @@ from PIL import Image
 from .bioclip import BioCLIP, label_text
 from .boxes import get_box, open_db
 from .bursts import Encounter, FrameInfo, group_into_encounters
-from .detect import BirdDetector, Detection, FrameDetections, square_crop, sharpness
+from .detect import (BirdDetector, Detection, FrameDetections, sharpness,
+                     square_crop, usable_crop)
 from .extract import jpeg_to_image, load_frame, load_frame_jpg, load_photo
 from .home import lifer_home, find_regions_toml, trip_id_for
 from .lifelist import (LifeEntry, lifer_set, match_lifelist, parse_lifelist,
@@ -177,7 +178,11 @@ def classify_encounter(
         if box.source == "override":
             skip_cache.add(f.name)
         image = jpeg_to_image(rec._jpeg) if rec._jpeg else load_photo(rec.path)
-        crops.append((f.name, square_crop(image, box)))
+        crop = square_crop(image, box)
+        if not usable_crop(crop):
+            # blank/black frame or zero-area box: nothing to classify
+            continue
+        crops.append((f.name, crop))
         rec._jpeg = None  # drop the decoded JPEG; keep only the crop
 
     if crops:
@@ -317,14 +322,37 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
         torch.save(txt.cpu(), label_cache)
         print(f"  labels encoded [{time.time() - t0:.0f}s]", flush=True)
     cands: list[Candidate] = []
+    nodet_encs: list[dict[str, object]] = []  # encounters with no usable detection
+    nodet_frames: set[str] = set()  # their frames, for the thumbnail pass below
     order = sorted(classes)
     for i, enc in enumerate(encounters, 1):
         enc_id = f"enc_{i:04d}"
         best = enc.best_frame
         rec = records[best.name]
-        prob_vec = classify_encounter(enc, records, classes, bioclip, txt, cache_dir,
-                                      class_hash, temperature, folder=name,
-                                      conn=db_conn)
+        has_det = any(f.n_dets > 0 for f in enc.frames)
+        if has_det:
+            prob_vec = classify_encounter(enc, records, classes, bioclip, txt, cache_dir,
+                                          class_hash, temperature, folder=name,
+                                          conn=db_conn)
+        else:
+            # nothing to classify: no crop is ever fed to BioCLIP
+            prob_vec = [0.0] * len(order)
+        # all-zeros also when a detected frame's crop was blank/black (the
+        # classifier skips unusable crops): treat the encounter as no-detection
+        if not has_det or max(prob_vec) <= 0.0:
+            # No usable detection: no species and no candidates.csv row. The
+            # "No bird detected" section lists the encounter with a full-frame
+            # thumbnail (task 23), and the review app's crop editor can turn
+            # it into a real encounter by drawing a box.
+            nodet_encs.append({
+                "enc_id": enc_id,
+                "time_start": enc.start.strftime("%Y-%m-%d %H:%M:%S"),
+                "time_end": enc.end.strftime("%Y-%m-%d %H:%M:%S"),
+                "n_frames": len(enc.frames),
+                "best_frame": best.name,
+            })
+            nodet_frames.update(f.name for f in enc.frames)
+            continue
         p_clip = dict(zip(order, prob_vec))
         p_adj = {t: p_clip[t] * season.get(t, 0.0) ** alpha for t in order}
         adj_total = sum(p_adj.values()) or 1.0
@@ -336,7 +364,7 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
 
         adj_sorted = sorted(p_adj.items(), key=lambda kv: kv[1], reverse=True)
         adj_top1, adj_top1_p = adj_sorted[0]
-        has_det = bool(rec.dets.dets)
+        # has_det is True here: no-detection encounters `continue`d above
 
         # "Rare here": a confident raw top-1 on a species that is uncommon at
         # this place in the photo's month window. Computed on the RAW
@@ -344,8 +372,7 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
         # mask a true vagrant; beats lifer_lookalike (see run_folder docstring).
         raw_top1_tid, raw_top1_p = max(p_clip.items(), key=lambda kv: kv[1])
         rare_here = (
-            has_det
-            and raw_top1_p >= RARE_CONF
+            raw_top1_p >= RARE_CONF
             and (seasonal_counts.get(raw_top1_tid, 0.0) / seasonal_total) < RARE_SHARE
         )
         # evidence behind the rare flag: the species' share of the place's
@@ -361,7 +388,7 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
 
         possible_lifer = False
         lookalike = None
-        if has_det and adj_top1 not in lifers:
+        if adj_top1 not in lifers:
             # Closest lifelist species in the top 3; if it's within
             # LOOKALIKE_FRACTION of the top-1's probability, flag it as a
             # lookalike of a known bird instead of a possible lifer.
@@ -382,22 +409,21 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
             adj_top3=top3(p_adj),
             possible_lifer=possible_lifer,
             lifer_lookalike=lookalike,
-            has_det=has_det,
+            has_det=True,
             rare_here=rare_here,
             rare_evidence=rare_evidence,
         ))
-        # best crop for the review page (encounters without any detection
-        # get a placeholder card in the HTML)
-        if has_det:
-            crop_box = get_box(name, best.name, db_conn, dets=rec.dets.dets)
-            if crop_box is not None:
-                image = jpeg_to_image(rec._jpeg) if rec._jpeg else load_photo(rec.path)
-                save_crop(square_crop(image, crop_box), out_dir / "crops" / f"{enc_id}.jpg")
-                # full-frame preview with the detection box, for the lightbox
-                save_frame_preview(image, crop_box, out_dir / "frames" / f"{enc_id}.jpg")
-                # box-less full-frame preview for the crop editor (same scale)
-                save_frame_preview(image, None, out_dir / "frames" / "src" / f"{enc_id}.jpg")
-                rec._jpeg = None
+        # best crop for the review page (no-detection encounters never get
+        # here; they are listed in the "No bird detected" section instead)
+        crop_box = get_box(name, best.name, db_conn, dets=rec.dets.dets)
+        if crop_box is not None:
+            image = jpeg_to_image(rec._jpeg) if rec._jpeg else load_photo(rec.path)
+            save_crop(square_crop(image, crop_box), out_dir / "crops" / f"{enc_id}.jpg")
+            # full-frame preview with the detection box, for the lightbox
+            save_frame_preview(image, crop_box, out_dir / "frames" / f"{enc_id}.jpg")
+            # box-less full-frame preview for the crop editor (same scale)
+            save_frame_preview(image, None, out_dir / "frames" / "src" / f"{enc_id}.jpg")
+            rec._jpeg = None
         if i % 10 == 0 or i == len(encounters):
             print(f"  classified {i}/{len(encounters)} encounters "
                   f"[{time.time() - t0:.0f}s]", flush=True)
@@ -406,14 +432,32 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
 
     # --- no-detection thumbnails ----------------------------------------
     t0 = time.time()
-    no_det: list[tuple[str, str]] = []
+    no_det: list[dict[str, object]] = []
+    for ne in nodet_encs:
+        # full-frame thumbnail of the encounter's sharpest (det-less) frame
+        r = records[str(ne["best_frame"])]
+        image = jpeg_to_image(r._jpeg) if r._jpeg else load_photo(r.path)
+        r._jpeg = None
+        thumb_rel = f"crops/nodet/{ne['enc_id']}.jpg"
+        save_frame_preview(image, None, out_dir / thumb_rel, max_side=320)
+        no_det.append({
+            "id": ne["enc_id"], "time": str(ne["time_start"])[11:16],
+            "n_frames": ne["n_frames"], "best_frame": ne["best_frame"],
+            "thumb": thumb_rel,
+        })
+    # individual no-detection frames inside an encounter that has detected
+    # frames (the encounter itself is classified on its detected frames)
     for r in records.values():
-        if r.dets.dets:
+        if r.dets.dets or r.name in nodet_frames:
             continue
         image = jpeg_to_image(r._jpeg) if r._jpeg else load_photo(r.path)
         thumb_rel = f"crops/nodet/{r.name.rsplit('.', 1)[0]}.jpg"
         save_frame_preview(image, None, out_dir / thumb_rel, max_side=320)
-        no_det.append((r.name, thumb_rel))
+        no_det.append({
+            "id": r.name.rsplit(".", 1)[0],
+            "time": r.timestamp.strftime("%H:%M"),
+            "n_frames": 1, "best_frame": r.name, "thumb": thumb_rel,
+        })
     timings["thumbs"] = time.time() - t0
 
     # --- outputs ---------------------------------------------------------
@@ -422,6 +466,10 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
                               else 1 if c.lifer_lookalike
                               else 2, c.time_start))
     write_candidates_csv(cands, out_dir / "candidates.csv")
+    # no-detection encounters, for the review app's "No bird detected" section
+    # (full-frame thumbnail + fix-crop); a re-run rewrites this file
+    (out_dir / "nodet.json").write_text(
+        json.dumps(nodet_encs, indent=1) + "\n", encoding="utf-8")
     write_review_html(
         cands, no_det, out_dir / "review.html", name,
         region={
@@ -441,7 +489,8 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
     n_lookalikes = sum(1 for c in cands if c.lifer_lookalike)
     print(f"\n{name}: {len(photos)} frames, {len(encounters)} encounters, "
           f"{n_lifers} possible lifers, {n_lookalikes} lifer lookalikes, "
-          f"{len(no_det)} frames w/o birds")
+          f"{len(nodet_encs)} encounters + {len(no_det) - len(nodet_encs)} "
+          f"frames w/o birds")
     print(f"outputs: {out_dir}  (total {timings['total']:.0f}s)")
     db_conn.close()
     return out_dir

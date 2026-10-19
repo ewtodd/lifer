@@ -118,3 +118,20 @@ def sharpness(crop: Image.Image) -> float:
     if arr.shape[0] > 512:  # downscale large crops for a comparable measure
         arr = cv2.resize(arr, (512, 512), interpolation=cv2.INTER_AREA)
     return float(cv2.Laplacian(arr, cv2.CV_64F).var())
+
+
+def usable_crop(crop: Image.Image, min_variance: float = 1.0) -> bool:
+    """Whether a crop is worth classifying: non-empty and not near-uniform.
+
+    A zero-area box or a blank/black frame (e.g. a missing embedded JPEG)
+    must not be fed to BioCLIP: with nothing in the image the encoder picks
+    an arbitrary "top species". Near-uniform = grayscale pixel variance
+    below `min_variance`, measured on a downsampled copy (uniformity does
+    not need full resolution; real bird crops measure in the hundreds).
+    """
+    if crop is None or crop.width < 2 or crop.height < 2:
+        return False
+    small = crop.convert("L")
+    if max(small.size) > 256:
+        small = small.resize((min(256, small.width), min(256, small.height)))
+    return float(np.asarray(small).var()) >= min_variance

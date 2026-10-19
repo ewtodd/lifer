@@ -126,11 +126,122 @@ def load_candidates(folder: str) -> list[dict]:
     return rows
 
 
-def load_nodet(folder: str) -> list[str]:
+def load_nodet(folder: str) -> list[dict]:
+    """No-detection entries for a run's "No bird detected" section.
+
+    New runs write runs/<folder>/nodet.json (one entry per encounter with no
+    usable detection: enc_id, time_start, time_end, n_frames, best_frame).
+    Older runs have only per-frame thumbnails in crops/nodet/ (no encounter
+    info); those fall back to {"file": name} entries.
+    """
+    p = RUNS / folder / "nodet.json"
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [d for d in data
+                        if isinstance(d, dict) and d.get("enc_id")]
+        except (json.JSONDecodeError, OSError):
+            pass  # corrupt nodet.json: fall back to the thumbnails
     d = RUNS / folder / "crops" / "nodet"
-    if not d.is_dir():
+    if d.is_dir():
+        return [{"file": n.name} for n in sorted(d.iterdir())
+                if n.is_file() and n.suffix.lower() in (".jpg", ".jpeg", ".png")]
+    return []
+
+
+def _load_nodet_entries(folder: str) -> list[dict]:
+    p = RUNS / folder / "nodet.json"
+    if not p.is_file():
         return []
-    return sorted(p.name for p in d.glob("*.jpg"))
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_nodet_entries(folder: str, entries: list[dict]) -> None:
+    p = RUNS / folder / "nodet.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(entries, indent=1) + "\n", encoding="utf-8")
+
+
+def _remove_nodet_enc(folder: str, enc_id: str) -> None:
+    """Drop an encounter from nodet.json (it became a real candidate)."""
+    p = RUNS / folder / "nodet.json"
+    if not p.is_file():
+        return
+    _save_nodet_entries(folder,
+                        [e for e in _load_nodet_entries(folder)
+                         if e.get("enc_id") != enc_id])
+
+
+def _add_nodet_enc(folder: str, entry: dict) -> None:
+    """Put an encounter back into nodet.json (a crop fix was undone)."""
+    entries = _load_nodet_entries(folder)
+    if any(e.get("enc_id") == entry.get("enc_id") for e in entries):
+        return
+    entries.append({k: entry[k] for k in
+                    ("enc_id", "time_start", "time_end", "n_frames", "best_frame")
+                    if k in entry})
+    entries.sort(key=lambda e: str(e.get("time_start", "")))
+    _save_nodet_entries(folder, entries)
+
+
+def _candidate_fieldnames(folder: str) -> list[str]:
+    p = RUNS / folder / "candidates.csv"
+    if p.is_file():
+        with p.open() as f:
+            names = csv.DictReader(f).fieldnames
+        if names:
+            return list(names)
+    return ["enc_id", "time_start", "time_end", "n_frames", "best_frame",
+            "det_conf", "raw_top3", "adj_top3", "possible_lifer",
+            "lifer_lookalike", "rare_here", "rare_evidence"]
+
+
+def _insert_candidate_row(folder: str, enc_id: str, base: dict,
+                          fields: dict) -> None:
+    """Append a candidate row for a no-detection encounter that got a manual
+    crop fix: it had no row in candidates.csv before (task 23)."""
+    path = RUNS / folder / "candidates.csv"
+    fieldnames = _candidate_fieldnames(folder)
+    row = {
+        "enc_id": enc_id,
+        "time_start": base.get("time_start", ""),
+        "time_end": base.get("time_end", ""),
+        "n_frames": base.get("n_frames", 0),
+        "best_frame": base.get("best_frame", ""),
+        "det_conf": f"{float(base.get('det_conf', 0.0)):.3f}",
+        "raw_top3": _fmt_top3(fields["raw_top3"]),
+        "adj_top3": _fmt_top3(fields["adj_top3"]),
+        "possible_lifer": str(fields["possible_lifer"]),
+        "lifer_lookalike": fields.get("lifer_lookalike") or "",
+        "rare_here": str(fields["rare_here"]),
+        "rare_evidence": fields.get("rare_evidence") or "",
+    }
+    with path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if path.stat().st_size == 0:
+            w.writeheader()
+        w.writerow(row)
+
+
+def _remove_candidate_row(folder: str, enc_id: str) -> None:
+    """Delete a candidate row (its crop fix was undone; the encounter goes
+    back to "No bird detected")."""
+    path = RUNS / folder / "candidates.csv"
+    if not path.is_file():
+        return
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = [r for r in reader if r.get("enc_id") != enc_id]
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
 
 
 def list_folders() -> list[str]:
@@ -387,8 +498,30 @@ def build_trip(folder: str, conn: sqlite3.Connection) -> dict:
     for i, g3 in enumerate(groups):
         g3["gi"] = i
 
-    nodet = [{"id": n.rsplit(".", 1)[0], "file": n,
-              "thumb": f"/media/{folder}/crops/nodet/{n}"} for n in load_nodet(folder)]
+    # No-detection entries: encounters (nodet.json, task 23) plus, for older
+    # runs, lone per-frame thumbnails (no enc id, no fix-crop).
+    nodet = []
+    for n in load_nodet(folder):
+        if n.get("enc_id"):
+            nodet.append({
+                "id": n["enc_id"],
+                "file": n.get("best_frame", ""),
+                "time": str(n.get("time_start", ""))[11:16],
+                "n_frames": int(n.get("n_frames", 0)),
+                "best_frame": n.get("best_frame", ""),
+                "thumb": f"/media/{folder}/crops/nodet/{n['enc_id']}.jpg",
+                "enc": True,
+            })
+        else:
+            nodet.append({
+                "id": n["file"].rsplit(".", 1)[0],
+                "file": n["file"],
+                "time": "",
+                "n_frames": 0,
+                "best_frame": n["file"],
+                "thumb": f"/media/{folder}/crops/nodet/{n['file']}",
+                "enc": False,
+            })
 
     total = len(cands)
     decided = sum(1 for c in cands if c["decision"])
@@ -482,10 +615,26 @@ def _quality_score(enc: dict) -> tuple[float, float]:
     return sharp, conf
 
 
-def _find_candidate(folder: str, enc_id: str) -> dict | None:
+def _find_candidate(folder: str, enc_id: str):
     for c in load_candidates(folder):
         if c["enc_id"] == enc_id:
             return c
+    for n in load_nodet(folder):
+        if n.get("enc_id") == enc_id:
+            # No candidate row (no-detection encounter, task 23): a minimal
+            # view so the crop editor can turn it into a real encounter.
+            return {
+                "enc_id": enc_id,
+                "time_start": n.get("time_start", ""),
+                "time_end": n.get("time_end", ""),
+                "n_frames": int(n.get("n_frames", 0)),
+                "best_frame": n.get("best_frame", ""),
+                "det_conf": 0.0,
+                "raw_top3": [], "adj_top3": [], "top1": "",
+                "possible_lifer": False, "lifer_lookalike": None,
+                "rare_here": False, "rare_evidence": "",
+                "nodet": True,
+            }
     return None
 
 
@@ -968,13 +1117,20 @@ def create_app(db_path: Path) -> Flask:
         if c is None or not (RUNS / folder / "candidates.csv").is_file():
             return jsonify(ok=False, error="unknown encounter"), 400
         frame = c["best_frame"]
-        old_top1 = c["adj_top3"][0][0]
+        old_top1 = c.get("top1") or (c["adj_top3"][0][0] if c["adj_top3"] else "")
         if undo:
             snapshot = get_snapshot(g.db, folder, frame)
             clear_override(g.db, folder, frame)
             box = get_box(folder, frame, g.db)   # override cleared -> detector box
             if box is None:
-                return jsonify(ok=False, error="no detection box for this frame"), 400
+                # No detector box: this was a no-detection encounter that got
+                # a manual crop fix (task 23). Revert to "No bird detected":
+                # drop the candidate row and restore the nodet entry. (A
+                # detected encounter always has a detector box to fall back
+                # to, so this can't misfire.)
+                _remove_candidate_row(folder, enc_id)
+                _add_nodet_enc(folder, c)
+                return jsonify(ok=True, overridden=False, undo=True, nodet=True)
             try:
                 _regenerate_crop(folder, enc_id, frame, box)
             except (FileNotFoundError, RuntimeError) as e:
@@ -997,7 +1153,10 @@ def create_app(db_path: Path) -> Flask:
         if not (0 <= box.x1 < box.x2 <= W and 0 <= box.y1 < box.y2 <= H):
             return jsonify(ok=False, error="box outside frame"), 400
         # A snapshot of the pre-fix fields is kept for Undo (set only once).
-        snapshot = _snapshot_fields(c) if get_snapshot(g.db, folder, frame) is None else ""
+        # No-detection encounters have no pre-fix fields: their Undo reverts
+        # to the "No bird detected" section instead (see above).
+        snapshot = "" if c.get("nodet") else (
+            _snapshot_fields(c) if get_snapshot(g.db, folder, frame) is None else "")
         try:
             crop = _regenerate_crop(folder, enc_id, frame, box)
         except (FileNotFoundError, RuntimeError) as e:
@@ -1014,14 +1173,21 @@ def create_app(db_path: Path) -> Flask:
                      reid_old=(reid_info["old"] if reid_info else ""),
                      reid_new=(reid_info["new"] if reid_info else ""),
                      snapshot=snapshot)
-        _rewrite_candidate(folder, enc_id, {
-            "raw_top3": fields["raw_top3"],
-            "adj_top3": fields["adj_top3"],
-            "possible_lifer": fields["possible_lifer"],
-            "lifer_lookalike": fields["lifer_lookalike"],
-            "rare_here": fields["rare_here"],
-            "rare_evidence": fields["rare_evidence"],
-        })
+        if c.get("nodet"):
+            # This was a no-detection encounter: it had no row in
+            # candidates.csv, so create one and drop it from nodet.json
+            # (task 23).
+            _insert_candidate_row(folder, enc_id, c, fields)
+            _remove_nodet_enc(folder, enc_id)
+        else:
+            _rewrite_candidate(folder, enc_id, {
+                "raw_top3": fields["raw_top3"],
+                "adj_top3": fields["adj_top3"],
+                "possible_lifer": fields["possible_lifer"],
+                "lifer_lookalike": fields["lifer_lookalike"],
+                "rare_here": fields["rare_here"],
+                "rare_evidence": fields["rare_evidence"],
+            })
         return jsonify(ok=True, overridden=True,
                        reid=reid_info,
                        elapsed=fields["elapsed"],

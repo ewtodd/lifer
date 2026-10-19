@@ -130,24 +130,25 @@ def _enc_card(c: Candidate) -> dict:
     }
 
 
-def _nodet_card(name: str, thumb_rel: str) -> dict:
-    # one no-bird frame (not an encounter): filename + thumbnail only
+def _nodet_card(e: dict[str, object]) -> dict[str, object]:
+    # one no-bird entry: a no-detection encounter (id = enc_id, from nodet.json)
+    # or, for older runs, a single frame with no detection (per-frame id)
     return {
-        "id": name.rsplit(".", 1)[0],
+        "id": e["id"],
         "species": None,
-        "time": "",
-        "n_frames": 0,
-        "best_frame": name,
+        "time": e.get("time", ""),
+        "n_frames": e.get("n_frames", 0),
+        "best_frame": e["best_frame"],
         "det_conf": 0.0,
-        "frame": thumb_rel,
+        "frame": e["thumb"],
         "crop": None,
-        "thumb": thumb_rel,
+        "thumb": e["thumb"],
     }
 
 
-def write_review_html(cands: list[Candidate], no_det: list[tuple[str, str]],
+def write_review_html(cands: list[Candidate], no_det: list[dict[str, object]],
                       out_path: Path, folder: str,
-                      region: dict | None = None) -> None:
+                      region: dict[str, str] | None = None) -> None:
     """Write the self-contained review page.
 
     `region` (optional) is {"name", "short", "month", "window"} for the
@@ -158,8 +159,8 @@ def write_review_html(cands: list[Candidate], no_det: list[tuple[str, str]],
     esc = html.escape
 
     # Detected encounters go to their sections (rare beats lookalike). No-
-    # detection frames come from `no_det` (per-frame, built in the pipeline),
-    # not from the encounter list.
+    # detection entries (encounters, and lone frames from older runs) come
+    # from `no_det`, built in the pipeline.
     sections: dict[str, list[dict]] = {k: [] for k, _ in SECTIONS}
     for c in cands:
         if not c.has_det:
@@ -172,7 +173,7 @@ def write_review_html(cands: list[Candidate], no_det: list[tuple[str, str]],
             sections["lookalike"].append(_enc_card(c))
         else:
             sections["other"].append(_enc_card(c))
-    nodet: list[dict] = [_nodet_card(name, thumb) for name, thumb in no_det]
+    nodet: list[dict[str, object]] = [_nodet_card(e) for e in no_det]
 
     n_enc = len(cands)
     n_rare = len(sections["rare"])
@@ -304,10 +305,11 @@ def _card_html(c: dict, idx: int, sec: str, region: dict | None = None) -> str:
 
 def _nodet_html(c: dict, idx: int) -> str:
     esc = html.escape
+    t = f" &middot; {c['time']}" if c.get("time") else ""
     return (
         f'<figure class="nodet" data-idx="{idx}">'
         f'<img src="{c["thumb"]}" loading="lazy" alt="{esc(c["best_frame"])}">'
-        f'<figcaption>{esc(c["best_frame"])}</figcaption></figure>')
+        f'<figcaption>{esc(c["best_frame"])}{t}</figcaption></figure>')
 
 
 # ---------------------------------------------------------------------------

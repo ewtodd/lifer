@@ -112,7 +112,7 @@
     {% for n in t.nodet %}
     <figure class="nodet" data-idx="{{ loop.index0 }}">
       <img src="{{ n.thumb }}" loading="lazy" alt="{{ n.file }}">
-      <figcaption>{{ n.file }}</figcaption>
+      <figcaption>{{ n.file }}{% if n.time %} &middot; {{ n.time }}{% endif %}</figcaption>
     </figure>
     {% endfor %}
   </div>
@@ -320,9 +320,15 @@ function renderLb() {
     const n = DATA.nodet[cur.idx];
     $('lb-img').src = n.thumb;
     $('lb-toggle').style.display = 'none';
-    $('lb-fixcrop').style.display = 'none';
-    $('lb-caption').innerHTML = '<div class="lb-title">No bird detected</div>' +
-      '<div class="lb-meta">' + esc(n.file) + '</div>';
+    $('lb-fixcrop').style.display = n.enc ? '' : 'none';
+    let cap = '<div class="lb-title">No bird detected</div>';
+    if (n.enc)
+      cap += '<div class="lb-meta">' + esc(n.file) + ' &middot; ' + n.time +
+        ' &middot; ' + n.n_frames + ' frame' + (n.n_frames === 1 ? '' : 's') +
+        '</div>';
+    else
+      cap += '<div class="lb-meta">' + esc(n.file) + '</div>';
+    $('lb-caption').innerHTML = cap;
     actions.style.display = 'none';
     return;
   }
@@ -544,8 +550,15 @@ function ceDraw() {
   }
 }
 async function openCrop() {
-  if (!cur || cur.type !== 'enc') return;
-  const e = encAt(cur.gi, cur.ei);
+  if (!cur) return;
+  let e = null;
+  if (cur.type === 'enc') e = encAt(cur.gi, cur.ei);
+  else if (cur.type === 'nodet') {
+    const n = DATA.nodet[cur.idx];
+    if (!n.enc) return;   // legacy per-frame thumbnail: no encounter to fix
+    e = n;
+  }
+  if (!e) return;
   $('ce').style.display = 'flex';
   $('ce-undo').hidden = true;
   $('ce-hint').textContent = 'Loading\u2026';
