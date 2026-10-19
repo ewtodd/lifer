@@ -191,6 +191,12 @@ def main() -> None:
         print(f"published {info['species_count']} species "
               f"({info['with_photos']} with photos, {info['photos']} photos) "
               f"-> {Path(args.site).resolve()}/data/birds.json")
+        from .gallery import publish_gallery
+        g = publish_gallery(site=Path(args.site), db_path=Path(args.db))
+        print(f"gallery {g['in_gallery']} in gallery "
+              f"({g['rated_not_exported']} rated-not-exported, "
+              f"{g['rated_not_confirmed']} rated-not-confirmed) "
+              f"-> {Path(args.site).resolve()}/data/gallery.json")
     elif args.cmd == "develop":
         # imported here so `run`/`serve` stay torch-free; develop only needs
         # rawpy/PIL and darktable-cli on PATH

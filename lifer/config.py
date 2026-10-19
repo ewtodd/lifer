@@ -27,6 +27,9 @@ DEFAULTS: dict[str, dict[str, object]] = {
     "develop": {
         "style_sidecar": "",           # path to the owner's edited .xmp
     },
+    "gallery": {
+        "roots": ["~/BIRDING", "~/Pictures"],   # scan darktable sidecars here
+    },
 }
 
 
