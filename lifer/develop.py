@@ -32,7 +32,7 @@ import numpy as np
 from PIL import Image
 
 from .extract import load_frame
-from .home import lifer_home
+from .home import lifer_home, trip_id_for
 from .dxmp import (NO_MASK_BLENDOP, Module, crop_params, decode_params,
                    exposure_params, toneequal_params, write_sidecar)
 from .dtstyle import build_template
@@ -477,14 +477,15 @@ def _reference_crops(reference_sidecars: Path) -> dict[str, tuple[float, float, 
 
 def develop(source_folder: str, species: str = "", n: int = 5,
             frames: list[str] | None = None, lift: float = BIRD_LIFT,
-            style_sidecar: Path | None = None) -> int:
+            style_sidecar: Path | None = None,
+            root: str | Path | None = None) -> int:
     """Develop a set of frames with darktable-cli, in the style of ``style_sidecar``."""
     if style_sidecar is None:
         raise SystemExit("error: a style sidecar is required "
                          "(--style-sidecar, an edited .xmp)")
     home = lifer_home()
     source = Path(source_folder).expanduser()
-    folder = source.name
+    folder = trip_id_for(source, root)
     run_dir = home / "runs" / folder
     cache_dir = home / "cache" / folder
     src_dir = home / "develop" / folder / "src"
@@ -574,7 +575,8 @@ def benchmark(source_folder: str, reference_dir: Path,
               frames: list[str] | None = None,
               reference_sidecars: Path | None = None,
               lift: float = BIRD_LIFT,
-              style_sidecar: Path | None = None) -> int:
+              style_sidecar: Path | None = None,
+              root: str | Path | None = None) -> int:
     """Develop frames against a reference export set and compare lifer vs it.
 
     Uses the reference's own crop for framing parity so the three panels
@@ -585,7 +587,7 @@ def benchmark(source_folder: str, reference_dir: Path,
                          "(--style-sidecar, an edited .xmp)")
     home = lifer_home()
     source = Path(source_folder).expanduser()
-    folder = source.name
+    folder = trip_id_for(source, root)
     cache_dir = home / "cache" / folder
     src_dir = home / "develop" / folder / "src"
     bench = home / "edits" / "benchmark"

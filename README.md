@@ -15,7 +15,8 @@ The trip review page, with species groups:
 
 ## How it works
 
-For every `.NEF` in a folder:
+For every photo in a folder (each NEF's embedded full-size JPEG, or a
+standalone JPEG in a folder with no NEFs):
 
 1. **Detection** - a YOLO11m bird detector finds a bird box in the embedded
    JPEG (per-image, cached).
@@ -62,6 +63,11 @@ Then you:
 # ~/.local/share/lifer)
 nix run ~/path/to/lifer -- run /path/to/trip-folder
 
+# process a whole backlog at once: every photo folder under a root, one at a
+# time; duplicate copies and folders with no region are skipped and listed
+nix run ~/path/to/lifer -- run-all /path/to/photo-archive --dry-run
+nix run ~/path/to/lifer -- run-all /path/to/photo-archive
+
 # review the results in the web app (http://127.0.0.1:8000)
 nix run ~/path/to/lifer -- serve
 
@@ -101,6 +107,13 @@ State lives in `LIFER_HOME` (env var, else `--home`, else
 `~/.local/share/lifer`): `runs/` outputs, `cache/` per-image and API
 caches, `data/` the lifelist and the decisions DB. Model weights live in
 `~/.cache/lifer` (re-downloadable).
+
+A folder directly under its root takes the folder name as its trip ID; a
+nested folder takes its root-relative path with the separators replaced by
+`--` (pass `--root` to `run` and `develop` when the folder is more than one
+level deep). `run` records the source folder in `runs/<trip>/meta.json`, and
+everything that re-opens the photos (the review app's crop editor and
+light-box, re-ID, publish, develop) reads it from there.
 
 The one setting you will want to edit is the region map. A user copy at
 `LIFER_HOME/regions.toml` overrides the one shipped with the package; it

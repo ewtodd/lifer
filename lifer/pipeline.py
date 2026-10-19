@@ -1,7 +1,9 @@
-"""Pipeline orchestration: NEF -> detect -> encounters -> BioCLIP -> outputs.
+"""Pipeline orchestration: photos -> detect -> encounters -> BioCLIP -> outputs.
 
-Slow/networked work is cached under cache/ keyed per image and per API result,
-so re-runs skip finished work. Nothing is ever written under the source folder.
+A "photo" is an NEF (its embedded full-size JPEG) or, in a folder with no
+NEFs, a standalone JPEG. Slow/networked work is cached under cache/ keyed per
+image and per API result, so re-runs skip finished work. Nothing is ever
+written under the source folder.
 """
 
 from __future__ import annotations
@@ -23,8 +25,8 @@ from .bioclip import BioCLIP, label_text
 from .boxes import get_box, open_db
 from .bursts import Encounter, FrameInfo, group_into_encounters
 from .detect import BirdDetector, Detection, FrameDetections, square_crop, sharpness
-from .extract import load_frame, jpeg_to_image
-from .home import lifer_home, find_regions_toml
+from .extract import jpeg_to_image, load_frame, load_frame_jpg, load_photo
+from .home import lifer_home, find_regions_toml, trip_id_for
 from .lifelist import (LifeEntry, lifer_set, match_lifelist, parse_lifelist,
                        write_lifelist_csv)
 from .outputs import Candidate, save_crop, save_frame_preview, write_candidates_csv, write_review_html
@@ -52,15 +54,16 @@ RARE_CONF = 0.60
 RARE_SHARE = 0.002
 
 
-def resolve_region(folder_name: str) -> dict:
-    """First regions.toml entry whose glob matches the folder name."""
+def resolve_region(trip_id: str) -> dict:
+    """First regions.toml entry whose glob matches the trip ID (a nested
+    outing's ID carries its parent folder, so globs can match either)."""
     cfg = tomllib.loads(find_regions_toml().read_text())
     for region in cfg.get("region", []):
         import fnmatch
-        if fnmatch.fnmatch(folder_name, region["glob"]):
+        if fnmatch.fnmatch(trip_id, region["glob"]):
             return region
     raise SystemExit(
-        f"no region in regions.toml matches folder {folder_name!r}; "
+        f"no region in regions.toml matches trip {trip_id!r}; "
         "add a [[region]] entry with glob/name/place_id"
     )
 
@@ -106,7 +109,8 @@ def load_frame_with_dets(
         except (json.JSONDecodeError, KeyError, ValueError):
             pass  # corrupt cache entry: recompute
 
-    frame = load_frame(nef)
+    frame = (load_frame(nef) if nef.suffix.lower() == ".nef"
+             else load_frame_jpg(nef))
     image = jpeg_to_image(frame.jpeg)
     fd = detector.detect(image)
     fd.frame_name = nef.name
@@ -172,7 +176,7 @@ def classify_encounter(
                 pass
         if box.source == "override":
             skip_cache.add(f.name)
-        image = jpeg_to_image(rec._jpeg) if rec._jpeg else jpeg_to_image(load_frame(rec.path).jpeg)
+        image = jpeg_to_image(rec._jpeg) if rec._jpeg else load_photo(rec.path)
         crops.append((f.name, square_crop(image, box)))
         rec._jpeg = None  # drop the decoded JPEG; keep only the crop
 
@@ -198,7 +202,9 @@ def classify_encounter(
     return [sum(v.get(t, 0.0) for v in vectors) / n for t in order]
 
 
-def run_folder(folder_arg: str, gap_seconds: float = 5.0, alpha: float = 0.3,
+def run_folder(folder_arg: str | Path, root: str | Path | None = None,
+               gap_seconds: float = 5.0,
+               alpha: float = 0.3,
                yolo_weights: str = "yolo11m.pt", imgsz: int = 1280,
                conf: float = 0.25, temperature: float = 3.0) -> Path:
     t_start = time.time()
@@ -206,10 +212,15 @@ def run_folder(folder_arg: str, gap_seconds: float = 5.0, alpha: float = 0.3,
     if not folder.is_dir():
         raise SystemExit(f"not a directory: {folder}")
     home = lifer_home()
-    name = folder.name
+    name = trip_id_for(folder, root)
     out_dir = home / "runs" / name
     cache_dir = home / "cache" / name
     inat_cache = home / "cache" / "inat"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Where the photos live, for everything that re-opens them later (review
+    # app, re-ID, publish, develop): nested folders are not at ~/BIRDING/<name>.
+    (out_dir / "meta.json").write_text(json.dumps(
+        {"trip_id": name, "folder": str(folder)}, indent=2) + "\n")
     timings: dict[str, float] = {}
     db_conn = open_db()  # reads manual crop overrides so re-runs keep fixes
 
@@ -240,19 +251,24 @@ def run_folder(folder_arg: str, gap_seconds: float = 5.0, alpha: float = 0.3,
     # --- frames: extract + detect ---------------------------------------
     t0 = time.time()
     nefs = sorted(folder.glob("*.NEF"))
-    if not nefs:
-        raise SystemExit(f"no .NEF files in {folder}")
+    if nefs:
+        photos = nefs  # mixed folders use the NEFs, never the sidecar JPGs
+    else:
+        photos = sorted(p for p in folder.iterdir()
+                        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg"))
+    if not photos:
+        raise SystemExit(f"no .NEF or .jpg/.jpeg files in {folder}")
     detector = BirdDetector(weights=yolo_weights, imgsz=imgsz, conf=conf)
     records: dict[str, FrameRecord] = {}
-    for i, nef in enumerate(nefs, 1):
-        rec = load_frame_with_dets(nef, detector, cache_dir)
+    for i, photo in enumerate(photos, 1):
+        rec = load_frame_with_dets(photo, detector, cache_dir)
         records[rec.name] = rec
-        if i % 25 == 0 or i == len(nefs):
-            print(f"  frames {i}/{len(nefs)} "
+        if i % 25 == 0 or i == len(photos):
+            print(f"  frames {i}/{len(photos)} "
                   f"[{time.time() - t0:.0f}s]", flush=True)
     n_detected = sum(1 for r in records.values() if r.dets.dets)
     timings["detect"] = time.time() - t0
-    print(f"detection: {n_detected}/{len(nefs)} frames with birds "
+    print(f"detection: {n_detected}/{len(photos)} frames with birds "
           f"[{timings['detect']:.0f}s]")
 
     # --- encounters ------------------------------------------------------
@@ -375,7 +391,7 @@ def run_folder(folder_arg: str, gap_seconds: float = 5.0, alpha: float = 0.3,
         if has_det:
             crop_box = get_box(name, best.name, db_conn, dets=rec.dets.dets)
             if crop_box is not None:
-                image = jpeg_to_image(rec._jpeg) if rec._jpeg else jpeg_to_image(load_frame(rec.path).jpeg)
+                image = jpeg_to_image(rec._jpeg) if rec._jpeg else load_photo(rec.path)
                 save_crop(square_crop(image, crop_box), out_dir / "crops" / f"{enc_id}.jpg")
                 # full-frame preview with the detection box, for the lightbox
                 save_frame_preview(image, crop_box, out_dir / "frames" / f"{enc_id}.jpg")
@@ -394,7 +410,7 @@ def run_folder(folder_arg: str, gap_seconds: float = 5.0, alpha: float = 0.3,
     for r in records.values():
         if r.dets.dets:
             continue
-        image = jpeg_to_image(r._jpeg) if r._jpeg else jpeg_to_image(load_frame(r.path).jpeg)
+        image = jpeg_to_image(r._jpeg) if r._jpeg else load_photo(r.path)
         thumb_rel = f"crops/nodet/{r.name.rsplit('.', 1)[0]}.jpg"
         save_frame_preview(image, None, out_dir / thumb_rel, max_side=320)
         no_det.append((r.name, thumb_rel))
@@ -423,7 +439,7 @@ def run_folder(folder_arg: str, gap_seconds: float = 5.0, alpha: float = 0.3,
 
     n_lifers = sum(1 for c in cands if c.possible_lifer)
     n_lookalikes = sum(1 for c in cands if c.lifer_lookalike)
-    print(f"\n{name}: {len(nefs)} frames, {len(encounters)} encounters, "
+    print(f"\n{name}: {len(photos)} frames, {len(encounters)} encounters, "
           f"{n_lifers} possible lifers, {n_lookalikes} lifer lookalikes, "
           f"{len(no_det)} frames w/o birds")
     print(f"outputs: {out_dir}  (total {timings['total']:.0f}s)")

@@ -28,8 +28,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .boxes import (Box, clear_override, get_box, get_override, get_reid,
                     get_snapshot, set_override, to_list)
-from .extract import load_frame, jpeg_to_image
-from .home import lifer_home, find_regions_toml
+from .extract import load_photo
+from .home import lifer_home, find_regions_toml, source_folder_for_trip
 from .outputs import CSS, save_crop, save_frame_preview
 from .region import region_display_names
 
@@ -37,9 +37,9 @@ from .region import region_display_names
 RUNS = lifer_home() / "runs"
 INAT_CACHE = lifer_home() / "cache" / "inat"
 LIFELIST_CSV = lifer_home() / "data" / "lifelist.csv"
-# Source NEFs live on the read-only BIRDING share; the crop editor reads them to
-# pull the full-size embedded JPEG (read-only). Nothing is ever written there.
-BIRDING = Path.home() / "BIRDING"
+# Source photos live on the read-only BIRDING share (wherever the run's
+# meta.json points); the crop editor re-reads them to pull the full-size
+# image (read-only). Nothing is ever written there.
 
 SECTIONS: list[tuple[str, str]] = [
     ("rare", "Rare here"),
@@ -490,15 +490,15 @@ def _find_candidate(folder: str, enc_id: str) -> dict | None:
 
 
 def _frame_size(folder: str, frame: str) -> tuple[int, int]:
-    """Full-pixel (w, h) of a frame's embedded JPEG from the cache/detection,
-    else by reading the NEF (read-only)."""
+    """Full-pixel (w, h) of a frame from the cache/detection, else by
+    reading the source photo (read-only)."""
     cache = _frame_cache(folder, frame) or {}
     if cache.get("width") and cache.get("height"):
         return int(cache["width"]), int(cache["height"])
-    nef = BIRDING / folder / frame
-    if not nef.is_file():
-        raise FileNotFoundError(f"missing NEF: {nef}")
-    image = jpeg_to_image(load_frame(nef).jpeg)
+    photo = source_folder_for_trip(folder) / frame
+    if not photo.is_file():
+        raise FileNotFoundError(f"missing photo: {photo}")
+    image = load_photo(photo)
     return image.size
 
 
@@ -520,11 +520,11 @@ def _crop_square(image, box: Box, margin: float = 0.20):
 def _regenerate_crop(folder: str, enc_id: str, frame: str,
                      box: Box) -> Image.Image:
     """Regenerate the review app's crop + frame preview + box-less source
-    preview from the full-size embedded JPEG. Returns the crop PIL image."""
-    nef = BIRDING / folder / frame
-    if not nef.is_file():
-        raise FileNotFoundError(f"missing NEF: {nef}")
-    image = jpeg_to_image(load_frame(nef).jpeg)
+    preview from the full-size source image. Returns the crop PIL image."""
+    photo = source_folder_for_trip(folder) / frame
+    if not photo.is_file():
+        raise FileNotFoundError(f"missing photo: {photo}")
+    image = load_photo(photo)
     crop = _crop_square(image, box)
     save_crop(crop, RUNS / folder / "crops" / f"{enc_id}.jpg")
     save_frame_preview(image, box, RUNS / folder / "frames" / f"{enc_id}.jpg")
@@ -600,12 +600,12 @@ def _ensure_src_preview(folder: str, enc_id: str) -> Path | None:
     c = _find_candidate(folder, enc_id)
     if c is None:
         return None
-    nef = BIRDING / folder / c["best_frame"]
-    if not nef.is_file():
+    photo = source_folder_for_trip(folder) / c["best_frame"]
+    if not photo.is_file():
         return None
     try:
-        image = jpeg_to_image(load_frame(nef).jpeg)
-    except RuntimeError:
+        image = load_photo(photo)
+    except (RuntimeError, OSError):
         return None
     save_frame_preview(image, None, dst)
     return dst

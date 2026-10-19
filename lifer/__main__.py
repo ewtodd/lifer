@@ -18,7 +18,10 @@ def main() -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     run = sub.add_parser("run", help="run the pipeline on one photo folder")
-    run.add_argument("folder", help="folder of .NEF files (read-only input)")
+    run.add_argument("folder", help="folder of photos (NEFs, or JPEGs with no NEFs; read-only input)")
+    run.add_argument("--root", default=None,
+                     help="archive root the trip ID is relative to (default: the "
+                          "folder's parent, i.e. the trip ID is the folder name)")
     run.add_argument("--gap", type=float, default=5.0, help="burst gap threshold in seconds (default 5)")
     run.add_argument("--alpha", type=float, default=0.3, help="seasonal-prior exponent (default 0.3)")
     run.add_argument("--yolo", default="yolo11m.pt", help="YOLO weights (default yolo11m.pt)")
@@ -26,6 +29,20 @@ def main() -> None:
     run.add_argument("--conf", type=float, default=0.25, help="detection confidence threshold (default 0.25)")
     run.add_argument("--temp", type=float, default=3.0,
                      help="BioCLIP temperature: logits/T before softmax (default 3.0)")
+
+    runall = sub.add_parser(
+        "run-all",
+        help="process every photo folder under a root (the backlog)")
+    runall.add_argument("root", help="archive root to scan for photo folders (read-only)")
+    runall.add_argument("--dry-run", action="store_true",
+                        help="print the plan without running anything")
+    runall.add_argument("--gap", type=float, default=5.0, help="burst gap threshold in seconds (default 5)")
+    runall.add_argument("--alpha", type=float, default=0.3, help="seasonal-prior exponent (default 0.3)")
+    runall.add_argument("--yolo", default="yolo11m.pt", help="YOLO weights (default yolo11m.pt)")
+    runall.add_argument("--imgsz", type=int, default=1280, help="detection input size (default 1280)")
+    runall.add_argument("--conf", type=float, default=0.25, help="detection confidence threshold (default 0.25)")
+    runall.add_argument("--temp", type=float, default=3.0,
+                        help="BioCLIP temperature: logits/T before softmax (default 3.0)")
 
     serve = sub.add_parser("serve", help="serve the review web app (default 127.0.0.1)")
     serve.add_argument("--host", default="127.0.0.1", help="interface to bind (default 127.0.0.1)")
@@ -40,6 +57,9 @@ def main() -> None:
 
     develop = sub.add_parser("develop", help="develop selected raw photos into edits")
     develop.add_argument("folder", help="folder of .NEF files already run (read-only input)")
+    develop.add_argument("--root", default=None,
+                         help="archive root the trip ID is relative to (default: "
+                              "the folder's parent, i.e. the trip ID is the folder name)")
     develop.add_argument("--species", default=None,
                          help="species to pick frames for (adjusted top-1)")
     develop.add_argument("--n", type=int, default=5,
@@ -86,6 +106,19 @@ def main() -> None:
         from .pipeline import run_folder
         run_folder(
             args.folder,
+            root=args.root,
+            gap_seconds=args.gap,
+            alpha=args.alpha,
+            yolo_weights=args.yolo,
+            imgsz=args.imgsz,
+            conf=args.conf,
+            temperature=args.temp,
+        )
+    elif args.cmd == "run-all":
+        from .runall import run_all
+        run_all(
+            args.root,
+            dry_run=args.dry_run,
             gap_seconds=args.gap,
             alpha=args.alpha,
             yolo_weights=args.yolo,
@@ -121,12 +154,14 @@ def main() -> None:
             ref_sidecars = (Path(args.reference_sidecars).expanduser()
                             if args.reference_sidecars else ref_dir)
             benchmark(args.folder, reference_dir=ref_dir, frames=frames,
-                      style_sidecar=style_sidecar, reference_sidecars=ref_sidecars)
+                      style_sidecar=style_sidecar, reference_sidecars=ref_sidecars,
+                      root=args.root)
         elif args.species:
             develop(args.folder, species=args.species, n=args.n, frames=frames,
-                    style_sidecar=style_sidecar)
+                    style_sidecar=style_sidecar, root=args.root)
         else:
-            develop(args.folder, frames=frames, style_sidecar=style_sidecar)
+            develop(args.folder, frames=frames, style_sidecar=style_sidecar,
+                    root=args.root)
     elif args.cmd == "dt-style":
         from .dtstyle import run_dt_style
         run_dt_style(sidecars=args.sidecars, source=args.source)

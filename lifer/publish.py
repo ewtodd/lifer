@@ -26,13 +26,13 @@ from typing import Any
 from PIL import Image
 
 from .boxes import get_box
-from .extract import jpeg_to_image, load_frame
-from .home import lifer_home
+from .extract import load_photo
+from .home import lifer_home, source_folder_for_trip
 from .web import (_init_db, aves_taxa, build_sightings, _summarize)
 
-# Source NEFs live on the read-only BIRDING share; the pipeline reads them to
-# pull the embedded full-frame JPEG for cropping. Publish only reads.
-BIRDING = Path.home() / "BIRDING"
+# Source photos live on the read-only BIRDING share (wherever the run's
+# meta.json points); publish reads the full-frame image for cropping.
+# Publish only reads.
 
 LONG_EDGE = 1600     # px, photo long edge
 THUMB_EDGE = 400     # px, thumbnail long edge
@@ -120,11 +120,11 @@ def _render_photo(enc: dict[str, Any], out_full: Path, out_thumb: Path, conn) ->
         except (OSError, ValueError):
             return False
     else:
-        nef = BIRDING / folder / enc["best_frame"]
-        if not nef.is_file():
+        photo = source_folder_for_trip(folder) / enc["best_frame"]
+        if not photo.is_file():
             return False
         try:
-            image = jpeg_to_image(load_frame(nef).jpeg)
+            image = load_photo(photo)
         except (OSError, ValueError, RuntimeError):
             return False
         # Owner crop override wins; otherwise the detection box.
