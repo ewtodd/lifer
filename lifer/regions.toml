@@ -1,0 +1,22 @@
+# Region mapping: folder-name glob -> iNaturalist place.
+# place_id 1317 = "Wakulla County, US, FL" (iNat places/autocomplete).
+
+[[region]]
+glob = "*ST-MARKS*"
+name = "Wakulla County, FL"
+short_name = "Wakulla Co."
+place_id = 1317
+
+# place_id 2649 = "Washtenaw County, US, MI" (Ann Arbor).
+[[region]]
+glob = "*NICHOLS-ARBORETUM*"
+name = "Washtenaw County, MI"
+short_name = "Washtenaw Co."
+place_id = 2649
+
+# place_id 396 = "DuPage County, US, IL" (Greene Valley Forest Preserve, Woodridge).
+[[region]]
+glob = "*GREENE-VALLEY*"
+name = "DuPage County, IL"
+short_name = "DuPage Co."
+place_id = 396

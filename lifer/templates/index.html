@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lifer &mdash; trips</title>
+<style>{{ css | safe }}</style>
+</head>
+<body>
+<header>
+  <div class="folder">lifer <span style="font-weight:400;color:var(--muted)">trips</span></div>
+  <nav class="counts">
+    <a href="/lifelist">Lifelist</a>
+  </nav>
+</header>
+<main>
+  <table class="tbl">
+    <tr>
+      <th>Trip</th><th>Date</th><th>Region</th><th>Encounters</th>
+      <th>Review progress</th><th>Rare / lifer pending</th>
+    </tr>
+    {% for t in trips %}
+    <tr>
+      <td><a href="/trip/{{ t.folder }}">{{ t.folder }}</a></td>
+      <td>{{ t.date }}</td>
+      <td class="muted">{{ t.region }}</td>
+      <td>{{ t.total }}</td>
+      <td>
+        <span class="prog"><span class="prog-bar" style="width:{{ t.pct }}%"></span></span>
+        <span class="prog-n">{{ t.decided }}/{{ t.total }}</span>
+      </td>
+      <td>{% if t.pending %}<span class="badge rare">{{ t.pending }} pending</span>{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6" class="muted">No processed trips yet. Run <code>nix run . -- run &lt;folder&gt;</code> first.</td></tr>
+    {% endfor %}
+  </table>
+</main>
+</body>
+</html>

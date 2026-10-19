@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lifer"
+version = "0.1.0"
+description = "Find birds in raw photos, identify candidate species with BioCLIP, feed a lifelist."
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "torchvision",
+    "ultralytics",
+    "open-clip-torch",
+    "rawpy",
+    "odfpy",
+    "openpyxl",
+    "requests",
+    "rapidfuzz",
+    "numpy",
+    "pillow",
+    "flask",
+]
+
+[project.scripts]
+lifer = "lifer.__main__:main"
+
+[tool.setuptools]
+packages = ["lifer"]
+
+# regions.toml ships with the code; templates are the web app's Jinja files.
+[tool.setuptools.package-data]
+lifer = ["templates/*.html", "regions.toml"]

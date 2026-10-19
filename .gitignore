@@ -1,0 +1,18 @@
+# python caches
+__pycache__/
+*.pyc
+
+# nix build result symlink
+result
+
+# local agent scratch files (not project outputs)
+final.txt
+usage.json
+
+# darktable source + scratch analysis (agent workdir, not a project output)
+.dtsrc/
+
+# orchestration specs/reports (never published)
+.agent/
+# local agent conventions (personal paths; loaded by son-of-anton from the repo root)
+AGENTS.md

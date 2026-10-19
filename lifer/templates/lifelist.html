@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lifer &mdash; lifelist</title>
+<style>{{ css | safe }}</style>
+</head>
+<body>
+<header>
+  <div class="folder">Lifelist <span style="font-weight:400;color:var(--muted)">{{ rows | length }} species</span></div>
+  <nav class="counts">
+    <a href="/"><b>&larr;</b> all trips</a>
+    <a href="/lifelist?sort=taxon" class="{% if sort == 'taxon' %}on{% endif %}">Taxonomic order</a>
+    <a href="/lifelist?sort=date" class="{% if sort == 'date' %}on{% endif %}">By first date</a>
+    <a href="/api/lifelist/export?format=csv">Export CSV</a>
+    <a href="/api/lifelist/export?format=ods">Export ODS</a>
+  </nav>
+</header>
+<main>
+  <table class="tbl">
+    <tr>
+      <th>#</th><th>Species</th><th>First</th><th>Latest</th>
+      <th>Sightings</th><th>Photo</th>
+    </tr>
+    {% for r in rows %}
+    <tr class="life-row" data-key="{{ r.taxon_id }}" tabindex="0">
+      <td class="muted">{{ loop.index }}</td>
+      <td><b>{{ r.common }}</b> <i style="color:var(--muted)">{{ r.scientific }}</i>
+        {% if r.new %}<span class="badge new">new</span>{% endif %}</td>
+      <td>{{ r.first_date }}<div class="muted">{{ r.first_location }}</div></td>
+      <td>{{ r.latest_date }}<div class="muted">{{ r.latest_location }}</div>
+        {% if r.latest_photo_date and r.latest_photo_date != r.latest_date %}
+        <div class="muted">photo from {{ r.latest_photo_date }}</div>{% endif %}</td>
+      <td>{{ r.count }}</td>
+      <td>{% if r.thumb %}<img class="life-thumb" src="{{ r.thumb }}" loading="lazy" alt="">{% endif %}</td>
+    </tr>
+    <tr class="life-exp" hidden>
+      <td colspan="6">
+        <div class="life-sights">
+          {% for s in r.sightings %}
+          <div class="life-sight">
+            {% if s.thumb %}<img src="{{ s.thumb }}" loading="lazy" alt="">{% endif %}
+            <div><div class="d">{{ s.date }}</div><div class="p">{{ s.place }}</div></div>
+          </div>
+          {% endfor %}
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</main>
+<script>
+(function () {
+  var rows = document.querySelectorAll('.life-row');
+  rows.forEach(function (row) {
+    row.addEventListener('click', function () { toggle(row); });
+    row.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(row); }
+    });
+  });
+  function toggle(row) {
+    var exp = row.nextElementSibling;
+    if (exp && exp.classList.contains('life-exp')) exp.hidden = !exp.hidden;
+  }
+})();
+</script>
+</body>
+</html>

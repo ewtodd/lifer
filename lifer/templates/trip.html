@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lifer review &mdash; {{ t.folder }}</title>
+<style>{{ css | safe }}</style>
+<style>
+/* task 11: fix-crop editor */
+#ce { position:fixed; inset:0; z-index:110; background:#0c0d10; display:none;
+      flex-direction:column; align-items:center; justify-content:center; padding:18px; }
+.ce-stage { position:relative; max-width:96vw; max-height:82vh; }
+.ce-stage img { display:block; max-width:96vw; max-height:78vh; }
+.ce-stage canvas { position:absolute; inset:0; width:100%; height:100%;
+     cursor:crosshair; touch-action:none; }
+.ce-hint { color:#9aa; margin:10px 0 4px; font-size:13px; }
+.ce-btns { display:flex; gap:8px; padding:10px; }
+.badge.reid { background:#2b8a3e; color:#eaffea; }
+.ce-zoom { position:absolute; right:8px; bottom:8px; color:#8aa; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="folder">{{ t.folder }}</div>
+  <div class="daterange">{{ t.date_range }} &middot; {{ t.region }}</div>
+  <nav class="counts">
+    <a href="/"><b>&larr;</b> all trips</a>
+    <span class="counts-prog" id="progress"></span>
+    <label class="toggle"><input type="checkbox" id="hideDecided"> hide decided</label>
+    <a href="/lifelist">Lifelist</a>
+  </nav>
+</header>
+<main id="top">
+{% for sec_key, sec_title in t.sections %}
+{% set groups = t.groups | selectattr("section", "equalto", sec_key) | list %}
+{% if groups %}
+<section id="{{ sec_key }}" data-sec="{{ sec_key }}">
+  <h2>{{ sec_title }} <span class="sec-n" data-secn="{{ sec_key }}"></span></h2>
+  {% for grp in groups %}
+  {% set gi = grp.gi %}
+  {% set best = grp.encs[grp.best_i] %}
+  <article class="group" data-g="{{ gi }}">
+    <div class="g-head">
+      <img class="g-best" src="{{ best.crop }}" loading="lazy" alt="{{ grp.species }}" data-g="{{ gi }}" data-e="{{ grp.best_i }}">
+      <div class="g-info">
+        <h3 class="g-title">{{ grp.species }}{% if grp.scientific %} <span class="sci">{{ grp.scientific }}</span>{% endif %}
+          {% for b in grp.badges %}
+          {% if b == "rare" %}<span class="badge rare"{% if best.rare_evidence %} title="{{ best.rare_evidence }}"{% endif %}>{{ t.rare_badge }}</span>
+          {% elif b == "lifer" %}<span class="badge lifer">Possible lifer</span>
+          {% elif b.startswith("lookalike:") %}<span class="badge lookalike">Look-alike: {{ b.split(":", 1)[1] }}</span>{% endif %}
+          {% endfor %}
+          {% if best.override %}<span class="badge rare" title="crop overridden">crop fixed</span>{% endif %}
+          {% if best.reid %}<span class="badge reid">re-identified: {{ best.reid.old }} &rarr; {{ best.reid.new }}</span>{% endif %}
+        </h3>
+        <div class="g-meta"><b>{{ grp.n }}</b> encounter{{ "s" if grp.n != 1 }} &middot; <span data-gdec="{{ gi }}"></span> decided &middot; {{ grp.span }} &middot; {{ grp.frames }} frames</div>
+        <div class="g-strip">
+          {% for e in grp.encs %}
+          <img src="{{ e.crop }}" loading="lazy" alt="{{ e.id }}" class="{% if loop.index0 == grp.best_i %}sel{% endif %}" data-g="{{ gi }}" data-e="{{ loop.index0 }}">
+          {% endfor %}
+        </div>
+        <div class="g-actions">
+          <button class="btn primary" data-confirm-all="{{ gi }}">Confirm all as {{ grp.species }}</button>
+          <button class="btn" data-not-this="{{ gi }}">Not this species&hellip;</button>
+          <button class="btn expand" data-expand="{{ gi }}" aria-expanded="false">Show {{ grp.n }} encounter{{ "s" if grp.n != 1 }} &#9662;</button>
+        </div>
+      </div>
+    </div>
+    <div class="g-encs" data-gencs="{{ gi }}" hidden>
+      {% for e in grp.encs %}
+      <div class="enc" data-encrow="{{ e.id }}">
+        <img class="enc-crop" src="{{ e.crop }}" loading="lazy" alt="{{ e.id }}" data-g="{{ gi }}" data-e="{{ loop.index0 }}">
+        <div class="enc-info">
+          <div class="enc-line">{{ e.time }} &middot; {{ e.n_frames }} frame{{ "s" if e.n_frames != 1 }} &middot; {{ e.best_frame }} &middot; det {{ "%.3f" | format(e.det_conf) }} <span class="enc-chip" data-chip="{{ e.id }}"></span>
+            {% if e.has_override %}<span class="badge rare" title="crop overridden">crop fixed</span>{% endif %}
+            {% if e.reid %}<span class="badge reid">re-identified: {{ e.reid.old }} &rarr; {{ e.reid.new }}</span>{% endif %}
+          </div>
+          <ul class="top3">
+            {% for common, sci, p in e.adj_top3 %}
+            <li title="raw {{ "%.3f" | format(e.raw_map.get(common, -1)) if common in e.raw_map else "n/a" }}">
+              <span class="nm" title="{{ sci }}">{{ common }}</span>
+              <span class="track"><span class="bar" style="width:{{ (p * 100) | round(1) }}%"></span></span>
+              <span class="val">{{ p | round(2) }}</span>
+            </li>
+            {% endfor %}
+          </ul>
+          <div class="enc-actions">
+            <button class="btn sm" data-act="confirm" data-enc="{{ e.id }}">Confirm</button>
+            <span class="specpick">
+              <input class="spec-input" data-specin="{{ e.id }}" placeholder="Change species&hellip;" autocomplete="off">
+              <div class="ac-list" data-aclist="{{ e.id }}"></div>
+              <button class="btn sm" data-set-spec="{{ e.id }}">Set</button>
+            </span>
+            <button class="btn sm" data-act="not_bird" data-enc="{{ e.id }}">Not a bird</button>
+            <button class="btn sm" data-act="unsure" data-enc="{{ e.id }}">Unsure</button>
+            <input class="note-input" data-notein="{{ e.id }}" placeholder="note" value="{{ e.decision.note if e.decision else '' }}">
+            <button class="btn sm" data-save-note="{{ e.id }}">Save note</button>
+            <button class="btn sm" data-clear="{{ e.id }}" {% if not e.decision %}hidden{% endif %}>Undo</button>
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </article>
+  {% endfor %}
+</section>
+{% endif %}
+{% endfor %}
+{% if t.nodet %}
+<section id="nodet" data-sec="nodet">
+  <h2>No bird detected <span class="sec-n">{{ t.nodet | length }}</span></h2>
+  <div class="nodet-grid">
+    {% for n in t.nodet %}
+    <figure class="nodet" data-idx="{{ loop.index0 }}">
+      <img src="{{ n.thumb }}" loading="lazy" alt="{{ n.file }}">
+      <figcaption>{{ n.file }}</figcaption>
+    </figure>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+</main>
+
+<div class="lb" id="lb" role="dialog" aria-modal="true" aria-hidden="true">
+  <div class="lb-backdrop" id="lb-backdrop"></div>
+  <button class="lb-close" id="lb-close" aria-label="Close">&times;</button>
+  <button class="lb-nav lb-prev" id="lb-prev" aria-label="Previous">&#8249;</button>
+  <button class="lb-nav lb-next" id="lb-next" aria-label="Next">&#8250;</button>
+  <div class="lb-wrap"><div class="lb-inner">
+    <img class="lb-img" id="lb-img" alt="">
+    <button class="lb-toggle" id="lb-toggle">Show crop</button>
+    <div class="lb-caption" id="lb-caption"></div>
+    <div class="lb-actions" id="lb-actions">
+      <button class="btn primary" id="lb-confirm">Confirm <span class="lb-hint-k">C</span></button>
+      <span class="specpick">
+        <input class="spec-input" id="lb-spec" placeholder="Change species&hellip;" autocomplete="off">
+        <div class="ac-list" id="lb-spec-list"></div>
+        <button class="btn" id="lb-set-spec">Set</button>
+      </span>
+      <button class="btn" id="lb-notbird">Not a bird <span class="lb-hint-k">X</span></button>
+      <button class="btn" id="lb-unsure">Unsure <span class="lb-hint-k">U</span></button>
+      <input class="note-input" id="lb-note" placeholder="note">
+      <button class="btn" id="lb-save-note">Save note</button>
+      <button class="btn" id="lb-clear" hidden>Undo</button>
+      <button class="btn" id="lb-fixcrop">Fix crop</button>
+      <div class="lb-hint">C confirm &middot; U unsure &middot; X not identifiable &middot; N next undecided &middot; arrows browse group</div>
+    </div>
+  </div></div>
+  <div class="ce" id="ce" hidden>
+    <div class="ce-stage" id="ce-stage">
+      <img id="ce-src" alt="full frame">
+      <canvas id="ce-canvas"></canvas>
+      <div class="ce-zoom" id="ce-zoom"></div>
+    </div>
+    <div class="ce-hint" id="ce-hint">Click an outlined bird, or drag to draw a new crop</div>
+    <div class="ce-btns">
+      <button class="btn primary" id="ce-save">Save crop</button>
+      <button class="btn" id="ce-undo" hidden>Undo crop fix</button>
+      <button class="btn" id="ce-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const DATA = {{ data_json | safe }};
+const FOLDER = {{ t.folder | tojson }};
+const PLACE = {{ t.place_id | tojson }};
+
+let cur = null;            // {type:'enc', gi, ei} | {type:'nodet', idx}
+let showCrop = false;
+let savedScroll = 0;
+let hideDecided = false;
+// task 11: fix-crop editor state
+let cropState = null;      // {frame,w,h,boxes,override,src,enc}
+let selBox = null;         // [x1,y1,x2,y2] in full-pixel coords
+let ceDrag = null;         // {sx,sy,cx,cy} in canvas px
+let ceScale = 1;           // canvas px -> full-pixel divisor
+
+const $ = (id) => document.getElementById(id);
+const lb = $('lb');
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (m) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m];
+  });
+}
+function encAt(gi, ei) { return DATA.groups[gi].encs[ei]; }
+function decidedTotal() {
+  let n = 0;
+  DATA.groups.forEach(function (gr) { gr.encs.forEach(function (e) { if (e.decision) n++; }); });
+  return n;
+}
+function updateProgress() {
+  $('progress').textContent = decidedTotal() + ' / ' + DATA.total + ' decided';
+}
+function decChip(e) {
+  const d = e.decision;
+  let h = '';
+  if (!d) h = '<span class="chip none">undecided</span>';
+  else if (d.action === 'confirm') h = '<span class="chip confirm">Confirmed: ' + esc(d.species) + '</span>';
+  else if (d.action === 'change') h = '<span class="chip change">Changed to: ' + esc(d.species) + '</span>';
+  else if (d.action === 'not_bird') h = '<span class="chip notbird">Not a bird</span>';
+  else if (d.action === 'unsure') h = '<span class="chip unsure">Unsure</span>';
+  if (d && d.note) h += '<span class="chip-note">&ldquo;' + esc(d.note) + '&rdquo;</span>';
+  return h;
+}
+function refreshDom() {
+  updateProgress();
+  DATA.groups.forEach(function (gr, gi) {
+    const nd = gr.encs.filter(function (e) { return e.decision; }).length;
+    const gd = document.querySelector('[data-gdec="' + gi + '"]');
+    if (gd) gd.textContent = nd;
+    gr.encs.forEach(function (e) {
+      const chip = document.querySelector('[data-chip="' + e.id + '"]');
+      if (chip) chip.innerHTML = decChip(e);
+      const clr = document.querySelector('[data-clear="' + e.id + '"]');
+      if (clr) clr.hidden = !e.decision;
+    });
+    applyHideDecided(gi);
+  });
+  // section counts (groups visible in section)
+  document.querySelectorAll('section[data-sec]').forEach(function (sec) {
+    const key = sec.dataset.sec;
+    if (key === 'nodet') return;
+    const n = DATA.groups.filter(function (gr) { return gr.section === key; }).length;
+    const el = sec.querySelector('[data-secn]');
+    if (el) el.textContent = n;
+  });
+}
+function applyHideDecided(gi) {
+  const el = document.querySelector('.group[data-g="' + gi + '"]');
+  if (!el) return;
+  const all = DATA.groups[gi].encs.every(function (e) { return e.decision; });
+  el.classList.toggle('is-hidden', hideDecided && all);
+}
+
+// ---- decisions -------------------------------------------------------------
+async function sendDecision(e, action, species, scientific, note) {
+  const r = await fetch('/api/decisions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      folder: FOLDER, enc_id: e.id, best_frame: e.best_frame, action: action,
+      species: species || '', scientific: scientific || '', note: note || ''
+    })
+  });
+  const j = await r.json().catch(function () { return {}; });
+  if (!r.ok || !j.ok) { alert('Decision failed: ' + (j.error || r.status)); return false; }
+  e.decision = action === 'clear' ? null : { action: action, species: species || '', scientific: scientific || '', note: note || '' };
+  refreshDom();
+  if (cur && cur.type === 'enc') renderLb();
+  return true;
+}
+async function sendGroupAction(gi, action) {
+  const gr = DATA.groups[gi];
+  const r = await fetch('/api/group', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder: FOLDER, species: gr.species, scientific: gr.scientific, action: action })
+  });
+  const j = await r.json().catch(function () { return {}; });
+  if (!r.ok || !j.ok) { alert('Group action failed: ' + (j.error || r.status)); return; }
+  gr.encs.forEach(function (e) {
+    e.decision = action === 'confirm'
+      ? { action: 'confirm', species: gr.species, scientific: gr.scientific, note: '' }
+      : { action: 'unsure', species: '', scientific: '', note: '' };
+  });
+  refreshDom();
+  if (cur && cur.type === 'enc') renderLb();
+}
+
+// ---- lightbox ---------------------------------------------------------------
+function openLb(gi, ei) {
+  cur = { type: 'enc', gi: gi, ei: ei }; showCrop = false; savedScroll = window.scrollY;
+  renderLb();
+  lb.classList.add('open'); lb.setAttribute('aria-hidden', 'false');
+  document.body.style.overflow = 'hidden';
+}
+function openNodet(idx) {
+  cur = { type: 'nodet', idx: idx }; showCrop = false; savedScroll = window.scrollY;
+  renderLb();
+  lb.classList.add('open'); lb.setAttribute('aria-hidden', 'false');
+  document.body.style.overflow = 'hidden';
+}
+function closeLb() {
+  lb.classList.remove('open'); lb.setAttribute('aria-hidden', 'true');
+  document.body.style.overflow = '';
+  window.scrollTo(0, savedScroll); cur = null;
+}
+function nav(d) {
+  if (!cur || cur.type !== 'enc') return;
+  const encs = DATA.groups[cur.gi].encs;
+  let n = cur.ei + d;
+  if (n < 0) n = encs.length - 1;
+  if (n >= encs.length) n = 0;
+  cur.ei = n; showCrop = false; renderLb();
+}
+function nextUndecided() {
+  if (!cur || cur.type !== 'enc') return;
+  const encs = DATA.groups[cur.gi].encs;
+  for (let k = 1; k <= encs.length; k++) {
+    const n = (cur.ei + k) % encs.length;
+    if (!encs[n].decision) { cur.ei = n; showCrop = false; renderLb(); return; }
+  }
+}
+function badgeHtml(b, e) {
+  if (b === 'rare') {
+    const tip = (e && e.rare_evidence) ? ' title="' + esc(e.rare_evidence) + '"' : '';
+    return '<span class="badge rare"' + tip + '>' + esc(DATA.rare_badge) + '</span>';
+  }
+  if (b === 'lifer') return '<span class="badge lifer">Possible lifer</span>';
+  if (b.indexOf('lookalike:') === 0)
+    return '<span class="badge lookalike">Look-alike: ' + esc(b.slice(10)) + '</span>';
+  return '';
+}
+function fmtTop3(list) {
+  return list.map(function (r) { return esc(r[0]) + ' ' + Number(r[2]).toFixed(2); }).join(' &middot; ');
+}
+function renderLb() {
+  if (!cur) return;
+  const actions = $('lb-actions');
+  if (cur.type === 'nodet') {
+    const n = DATA.nodet[cur.idx];
+    $('lb-img').src = n.thumb;
+    $('lb-toggle').style.display = 'none';
+    $('lb-fixcrop').style.display = 'none';
+    $('lb-caption').innerHTML = '<div class="lb-title">No bird detected</div>' +
+      '<div class="lb-meta">' + esc(n.file) + '</div>';
+    actions.style.display = 'none';
+    return;
+  }
+  actions.style.display = '';
+  const e = encAt(cur.gi, cur.ei);
+  $('lb-fixcrop').style.display = '';
+  $('lb-img').src = (showCrop && e.crop) ? e.crop : e.frame;
+  $('lb-toggle').style.display = (e.crop && e.frame) ? '' : 'none';
+  $('lb-toggle').textContent = showCrop ? 'Show full frame' : 'Show crop';
+  let cap = '<div class="lb-title">' + esc(e.species);
+  if (e.sci) cap += ' <span class="lb-sci">' + esc(e.sci) + '</span>';
+  cap += '</div>';
+  if (e.badges && e.badges.length)
+    cap += '<div class="lb-badges">' + e.badges.map(function (b) { return badgeHtml(b, e); }).join('') + '</div>';
+  if (e.rare_evidence)
+    cap += '<div class="lb-ev">' + esc(e.rare_evidence) + '</div>';
+  cap += '<div class="lb-line">Adjusted: ' + fmtTop3(e.adj_top3) + '</div>';
+  cap += '<div class="lb-line muted">Raw: ' + fmtTop3(e.raw_top3) + '</div>';
+  cap += '<div class="lb-line" style="margin-top:8px">' + decChip(e) + '</div>';
+  cap += '<div class="lb-meta">' + e.time + ' &middot; ' + e.n_frames +
+    ' frame' + (e.n_frames === 1 ? '' : 's') + ' &middot; ' + esc(e.best_frame) +
+    ' &middot; det ' + Number(e.det_conf).toFixed(3) + '</div>';
+  $('lb-caption').innerHTML = cap;
+  $('lb-note').value = e.decision ? (e.decision.note || '') : '';
+  $('lb-clear').hidden = !e.decision;
+  $('lb-spec').value = '';
+  pendingSpecies = null;
+}
+
+// ---- species autocomplete ----------------------------------------------------
+let pendingSpecies = null;
+function attachAutocomplete(input, listDiv, onPick) {
+  let timer = null, items = [];
+  input.addEventListener('input', function () {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (!q) { listDiv.classList.remove('open'); items = []; return; }
+    timer = setTimeout(async function () {
+      const r = await fetch('/api/species?q=' + encodeURIComponent(q) + '&place=' + PLACE);
+      items = await r.json();
+      listDiv.innerHTML = items.map(function (s, i) {
+        return '<div class="ac-item" data-i="' + i + '">' + esc(s.common) +
+          (s.region ? ' <span class="ac-region">region</span>' : '') +
+          (s.scientific ? ' <i>' + esc(s.scientific) + '</i>' : '') + '</div>';
+      }).join('');
+      listDiv.classList.add('open');
+    }, 150);
+  });
+  listDiv.addEventListener('mousedown', function (ev) {
+    const it = ev.target.closest('.ac-item');
+    if (!it) return;
+    const s = items[+it.dataset.i];
+    input.value = s.common;
+    onPick(s);
+    listDiv.classList.remove('open');
+  });
+  document.addEventListener('click', function (ev) {
+    if (!input.contains(ev.target) && !listDiv.contains(ev.target)) listDiv.classList.remove('open');
+  });
+}
+
+// ---- wiring -------------------------------------------------------------------
+document.addEventListener('click', function (e2) {
+  const best = e2.target.closest('.g-best, .g-strip img, .enc-crop');
+  if (best) { openLb(+best.dataset.g, +best.dataset.e); return; }
+  const nd = e2.target.closest('.nodet');
+  if (nd) { openNodet(+nd.dataset.idx); return; }
+  const ex = e2.target.closest('[data-expand]');
+  if (ex) {
+    const gi = ex.dataset.expand;
+    const box = document.querySelector('[data-gencs="' + gi + '"]');
+    const open = box.hidden;
+    box.hidden = !open;
+    ex.setAttribute('aria-expanded', String(open));
+    ex.innerHTML = (open ? 'Hide' : 'Show') + ' ' + DATA.groups[gi].n + ' encounters ' + (open ? '&#9652;' : '&#9662;');
+    return;
+  }
+  const ca = e2.target.closest('[data-confirm-all]');
+  if (ca) { sendGroupAction(+ca.dataset.confirmAll, 'confirm'); return; }
+  const nt = e2.target.closest('[data-not-this]');
+  if (nt) { sendGroupAction(+nt.dataset.notThis, 'unsure'); return; }
+  const act = e2.target.closest('[data-act]');
+  if (act) {
+    const e = encAtByEncId(act.dataset.enc);
+    if (e) {
+      const a = act.dataset.act;
+      const note = (document.querySelector('[data-notein="' + e.id + '"]') || {}).value || '';
+      if (a === 'confirm') sendDecision(e, 'confirm', e.species, e.sci, note);
+      else sendDecision(e, a, '', '', note);
+    }
+    return;
+  }
+  const ss = e2.target.closest('[data-set-spec]');
+  if (ss) {
+    const e = encAtByEncId(ss.dataset.setSpec);
+    if (e && rowPending[ss.dataset.setSpec]) {
+      const s = rowPending[ss.dataset.setSpec];
+      sendDecision(e, 'change', s.common, s.scientific,
+        (document.querySelector('[data-notein="' + e.id + '"]') || {}).value || '');
+      document.querySelector('[data-specin="' + e.id + '"]').value = '';
+    }
+    return;
+  }
+  const sn = e2.target.closest('[data-save-note]');
+  if (sn) {
+    const e = encAtByEncId(sn.dataset.saveNote);
+    if (e) {
+      const note = (document.querySelector('[data-notein="' + e.id + '"]') || {}).value || '';
+      sendDecision(e, e.decision ? e.decision.action : 'unsure',
+        e.decision ? (e.decision.species || '') : '', e.decision ? (e.decision.scientific || '') : '', note);
+    }
+    return;
+  }
+  const cl = e2.target.closest('[data-clear]');
+  if (cl) { const e = encAtByEncId(cl.dataset.clear); if (e) sendDecision(e, 'clear'); return; }
+  if (e2.target.id === 'lb-backdrop') closeLb();
+});
+function encAtByEncId(id) {
+  for (let gi = 0; gi < DATA.groups.length; gi++) {
+    for (let ei = 0; ei < DATA.groups[gi].encs.length; ei++) {
+      if (DATA.groups[gi].encs[ei].id === id) return DATA.groups[gi].encs[ei];
+    }
+  }
+  return null;
+}
+document.getElementById('lb-close').addEventListener('click', closeLb);
+document.getElementById('lb-prev').addEventListener('click', function () { nav(-1); });
+document.getElementById('lb-next').addEventListener('click', function () { nav(1); });
+document.getElementById('lb-toggle').addEventListener('click', function () {
+  if (cur && cur.type === 'enc') { showCrop = !showCrop; renderLb(); }
+});
+$('hideDecided').addEventListener('change', function (e2) {
+  hideDecided = e2.target.checked;
+  DATA.groups.forEach(function (_gr, gi) { applyHideDecided(gi); });
+  document.querySelectorAll('section[data-sec]').forEach(function (sec) {
+    const key = sec.dataset.sec;
+    if (key === 'nodet') return;
+    const anyVisible = DATA.groups.some(function (gr, gi) {
+      return gr.section === key && !document.querySelector('.group[data-g="' + gi + '"]').classList.contains('is-hidden');
+    });
+    sec.classList.toggle('is-hidden', hideDecided && !anyVisible);
+  });
+});
+// lightbox actions
+attachAutocomplete($('lb-spec'), $('lb-spec-list'), function (s) { pendingSpecies = s; });
+$('lb-confirm').addEventListener('click', function () {
+  if (cur && cur.type === 'enc') {
+    const e = encAt(cur.gi, cur.ei);
+    sendDecision(e, 'confirm', e.species, e.sci, $('lb-note').value);
+  }
+});
+$('lb-notbird').addEventListener('click', function () {
+  if (cur && cur.type === 'enc') sendDecision(encAt(cur.gi, cur.ei), 'not_bird', '', '', $('lb-note').value);
+});
+$('lb-unsure').addEventListener('click', function () {
+  if (cur && cur.type === 'enc') sendDecision(encAt(cur.gi, cur.ei), 'unsure', '', '', $('lb-note').value);
+});
+$('lb-set-spec').addEventListener('click', function () {
+  if (cur && cur.type === 'enc' && pendingSpecies) {
+    sendDecision(encAt(cur.gi, cur.ei), 'change', pendingSpecies.common, pendingSpecies.scientific, $('lb-note').value);
+    $('lb-spec').value = ''; pendingSpecies = null;
+  }
+});
+$('lb-save-note').addEventListener('click', function () {
+  if (cur && cur.type === 'enc') {
+    const e = encAt(cur.gi, cur.ei);
+    sendDecision(e, e.decision ? e.decision.action : 'unsure',
+      e.decision ? (e.decision.species || '') : '', e.decision ? (e.decision.scientific || '') : '', $('lb-note').value);
+  }
+});
+$('lb-clear').addEventListener('click', function () {
+  if (cur && cur.type === 'enc') sendDecision(encAt(cur.gi, cur.ei), 'clear');
+});
+
+// ---- fix-crop editor ---------------------------------------------------------
+function sameBox(a, b) {
+  return a && b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
+}
+function ceSortBoxes(list) {
+  return (list || []).slice().sort(function (a, b) {
+    const ca = a.length > 4 ? a[4] : 0, cb = b.length > 4 ? b[4] : 0;
+    return cb - ca;
+  });
+}
+function ceLayout() {
+  const img = $('ce-src'), c = $('ce-canvas');
+  const rect = img.getBoundingClientRect();
+  c.width = Math.max(1, Math.round(rect.width));
+  c.height = Math.max(1, Math.round(rect.height));
+  $('ce-stage').style.width = rect.width + 'px';
+  $('ce-stage').style.height = rect.height + 'px';
+  ceScale = c.width / cropState.w;
+  $('ce-zoom').textContent = Math.round(rect.width) + '\u00d7' + Math.round(rect.height);
+  ceDraw();
+}
+function ceDraw() {
+  const c = $('ce-canvas');
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (!cropState) return;
+  const s = ceScale;
+  cropState.boxes.forEach(function (b, i) {
+    const cur = sameBox(b, selBox);
+    ctx.strokeStyle = cur ? '#ffc400' : 'rgba(255,255,255,0.7)';
+    ctx.lineWidth = cur ? 3.5 : 1.5;
+    const px = b[0] * s, py = b[1] * s, pw = (b[2] - b[0]) * s, ph = (b[3] - b[1]) * s;
+    ctx.strokeRect(px, py, pw, ph);
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(px, py - 18, 20, 18);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px sans-serif';
+    ctx.fillText(String(i + 1), px + 5, py - 4);
+  });
+  // a freshly drawn box (not one of the alternatives)
+  if (selBox && !cropState.boxes.some(function (b) { return sameBox(b, selBox); })) {
+    ctx.strokeStyle = '#ffc400'; ctx.lineWidth = 3;
+    ctx.strokeRect(selBox[0] * s, selBox[1] * s,
+                   (selBox[2] - selBox[0]) * s, (selBox[3] - selBox[1]) * s);
+  }
+}
+async function openCrop() {
+  if (!cur || cur.type !== 'enc') return;
+  const e = encAt(cur.gi, cur.ei);
+  $('ce').style.display = 'flex';
+  $('ce-undo').hidden = true;
+  $('ce-hint').textContent = 'Loading\u2026';
+  let j;
+  try {
+    const r = await fetch('/api/cropboxes?folder=' + encodeURIComponent(FOLDER) +
+      '&enc_id=' + encodeURIComponent(e.id));
+    j = await r.json().catch(function () { return {}; });
+  } catch (_) { j = {}; }
+  if (!j.ok) { alert('Could not load crop editor: ' + (j.error || 'unknown error')); closeCrop(); return; }
+  const sortedBoxes = ceSortBoxes(j.boxes);
+  cropState = { frame: j.frame, w: j.w, h: j.h, boxes: sortedBoxes,
+                override: j.override, src: j.src, enc: e };
+  selBox = j.override || sortedBoxes[0] || null;
+  const img = $('ce-src');
+  img.onload = function () { if (cropState) ceLayout(); };
+  img.src = j.src;
+  $('ce-hint').textContent = 'Click an outlined bird, or drag to draw a new crop';
+  $('ce-undo').hidden = !j.override;
+}
+function closeCrop() {
+  $('ce').style.display = 'none';
+  cropState = null; selBox = null; ceDrag = null;
+}
+function cePoint(ev) {
+  const rect = $('ce-canvas').getBoundingClientRect();
+  return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+}
+$('lb-fixcrop').addEventListener('click', openCrop);
+$('ce-cancel').addEventListener('click', closeCrop);
+$('ce-undo').addEventListener('click', async function () {
+  if (!cur || !cropState) return;
+  const e = cropState.enc;
+  const r = await fetch('/api/crop', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder: FOLDER, enc_id: e.id, frame: cropState.frame, undo: true })
+  });
+  const j = await r.json().catch(function () { return {}; });
+  if (!r.ok || !j.ok) { alert('Undo failed: ' + (j.error || r.status)); return; }
+  closeCrop();
+  window.location.reload();
+});
+$('ce-save').addEventListener('click', async function () {
+  if (!cur || !cropState) return;
+  if (!selBox) { alert('Draw a crop box or click an outlined bird first'); return; }
+  const e = cropState.enc;
+  const r = await fetch('/api/crop', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder: FOLDER, enc_id: e.id, frame: cropState.frame,
+      box: [selBox[0], selBox[1], selBox[2], selBox[3]] })
+  });
+  const j = await r.json().catch(function () { return {}; });
+  if (!r.ok || !j.ok) { alert('Crop save failed: ' + (j.error || r.status)); return; }
+  closeCrop();
+  window.location.reload();
+});
+(function () {
+  const c = $('ce-canvas');
+  c.addEventListener('pointerdown', function (ev) {
+    if (!cropState) return;
+    const p = cePoint(ev);
+    const s = ceScale;
+    const hit = cropState.boxes.find(function (b) {
+      const px = b[0] * s, py = b[1] * s;
+      return p.x >= px - 8 && p.x <= b[2] * s + 8 && p.y >= py - 8 && p.y <= b[3] * s + 8;
+    });
+    if (hit) { selBox = hit; ceDraw(); return; }
+    ceDrag = { sx: p.x, sy: p.y, cx: p.x, cy: p.y };
+    if (c.setPointerCapture) { try { c.setPointerCapture(ev.pointerId); } catch (_) {} }
+    ceDrawDrag();
+  });
+  c.addEventListener('pointermove', function (ev) {
+    if (!ceDrag) return;
+    const p = cePoint(ev);
+    ceDrag.cx = Math.max(0, Math.min(p.x, c.width));
+    ceDrag.cy = Math.max(0, Math.min(p.y, c.height));
+    ceDrawDrag();
+  });
+  c.addEventListener('pointerup', function (ev) {
+    if (!ceDrag) return;
+    const s = ceScale;
+    const x1 = Math.min(ceDrag.sx, ceDrag.cx) / s, y1 = Math.min(ceDrag.sy, ceDrag.cy) / s;
+    const x2 = Math.max(ceDrag.sx, ceDrag.cx) / s, y2 = Math.max(ceDrag.sy, ceDrag.cy) / s;
+    if (x2 - x1 > 20 && y2 - y1 > 20) {
+      selBox = [x1, y1, x2, y2];
+    }
+    ceDrag = null;
+    ceDraw();
+  });
+})();
+function ceDrawDrag() {
+  const c = $('ce-canvas'), ctx = c.getContext('2d');
+  ceDraw();
+  if (!ceDrag) return;
+  ctx.save();
+  ctx.strokeStyle = '#ffc400'; ctx.lineWidth = 3; ctx.setLineDash([8, 5]);
+  ctx.strokeRect(Math.min(ceDrag.sx, ceDrag.cx), Math.min(ceDrag.sy, ceDrag.cy),
+                 Math.abs(ceDrag.cx - ceDrag.sx), Math.abs(ceDrag.cy - ceDrag.sy));
+  ctx.restore();
+}
+
+// per-row autocomplete (one pending pick per row)
+const rowPending = {};
+document.querySelectorAll('.spec-input[data-specin]').forEach(function (input) {
+  const id = input.dataset.specin;
+  const listDiv = document.querySelector('[data-aclist="' + id + '"]');
+  attachAutocomplete(input, listDiv, function (s) { rowPending[id] = s; });
+});
+document.addEventListener('keydown', function (e3) {
+  if (cropState) { if (e3.key === 'Escape') closeCrop(); return; }
+  if (!lb.classList.contains('open')) return;
+  if (e3.target.matches('input,textarea')) return;
+  if (e3.key === 'Escape') closeLb();
+  else if (e3.key === 'ArrowLeft') nav(-1);
+  else if (e3.key === 'ArrowRight') nav(1);
+  else if (e3.key === 'c' || e3.key === 'C') $('lb-confirm').click();
+  else if (e3.key === 'u' || e3.key === 'U') $('lb-unsure').click();
+  else if (e3.key === 'x' || e3.key === 'X') $('lb-notbird').click();
+  else if (e3.key === 'n' || e3.key === 'N') nextUndecided();
+});
+(function () {
+  // #g=<group> expands the group; #g=<group>&e=<enc index> also opens the
+  // lightbox (deep links / screenshots)
+  const m = location.hash.match(/^#g=(\d+)(?:&e=(\d+))?$/);
+  if (m && DATA.groups[+m[1]]) {
+    const gi = +m[1];
+    const box = document.querySelector('[data-gencs="' + gi + '"]');
+    if (box) box.hidden = false;
+    const btn = document.querySelector('[data-expand="' + gi + '"]');
+    if (btn) {
+      btn.setAttribute('aria-expanded', 'true');
+      btn.innerHTML = 'Hide ' + DATA.groups[gi].n + ' encounters &#9652;';
+    }
+    if (m[2] !== undefined) {
+      const ei = +m[2];
+      if (DATA.groups[gi].encs[ei]) openLb(gi, ei);
+    }
+  }
+  refreshDom();
+})();
+</script>
+</body>
+</html>
