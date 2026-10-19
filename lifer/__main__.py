@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 
 def main() -> None:
@@ -70,6 +71,15 @@ def main() -> None:
                         help="delete (default: print what would be deleted)")
     delete.add_argument("--db", default=None,
                         help="decisions DB (default: LIFER_HOME/data/lifer.sqlite)")
+
+    mdec = sub.add_parser(
+        "migrate-decisions",
+        help="backfill decision frame lists and re-attach orphaned decisions "
+             "after a re-detection (task 25; dry run without --apply)")
+    mdec.add_argument("--db", default=None,
+                      help="decisions DB (default: LIFER_HOME/data/lifer.sqlite)")
+    mdec.add_argument("--apply", action="store_true",
+                      help="write the changes (default: print the plan only)")
 
     serve = sub.add_parser("serve", help="serve the review web app (default 127.0.0.1)")
     serve.add_argument("--host", default="127.0.0.1", help="interface to bind (default 127.0.0.1)")
@@ -198,6 +208,8 @@ def main() -> None:
         sys.exit(run_migrate(apply=args.apply))
     elif args.cmd == "migrate-trips":
         _cmd_migrate_trips(args)
+    elif args.cmd == "migrate-decisions":
+        _cmd_migrate_decisions(args)
     elif args.cmd == "delete":
         _cmd_delete(args)
 
@@ -298,6 +310,67 @@ def _cmd_delete(args) -> None:
             print("  nothing under the photo archive is ever touched")
     finally:
         conn.close()
+
+
+def _cmd_migrate_decisions(args) -> None:
+    """Task 25: backfill decision frame lists, re-attach orphaned decisions."""
+    from .decisions import apply_migrate_decisions, plan_migrate_decisions
+    from .home import lifer_home
+
+    home = lifer_home()
+    db_path, conn = _open_decisions_db(args.db)
+    try:
+        if args.apply:
+            res = apply_migrate_decisions(home, conn)
+            print(f"migrate-decisions (applied, db: {db_path})")
+        else:
+            res = plan_migrate_decisions(home, conn)
+            print(f"migrate-decisions (dry run, db: {db_path}; "
+                  f"re-run with --apply to write the changes)")
+        _print_migrate_decisions(res)
+    finally:
+        conn.close()
+
+
+def _print_migrate_decisions(res: dict[str, Any]) -> None:
+    if not res["n_decisions"]:
+        print("no decisions in the DB")
+        return
+    by_folder: dict[str, list[dict[str, Any]]] = {}
+    for e in res["entries"]:
+        by_folder.setdefault(e["folder"], []).append(e)
+    for folder in sorted(by_folder):
+        entries = by_folder[folder]
+        n_reatt = sum(1 for e in entries if e["changed"])
+        n_backfill = sum(1 for e in entries if not e["had_frames"])
+        print(f"  {folder}: {len(entries)} decision(s) to update "
+              f"({n_reatt} reattached, {n_backfill} frame-list backfill)")
+        for e in entries:
+            if e["conflict"]:
+                print(f"    CONFLICT (left in place): {e['enc_id']} {e['frame']} "
+                      f"-> {e['new_enc_id']} {e['new_frame']} already occupied")
+            elif e["changed"]:
+                print(f"    reattach {e['enc_id']} {e['frame']} "
+                      f"-> {e['new_enc_id']} {e['new_frame']} "
+                      f"({e['action']} {e['species'] or '-'}, "
+                      f"{len(e['new_frames'])} frames)")
+            else:
+                print(f"    backfill {e['enc_id']} {e['frame']} "
+                      f"({e['action']} {e['species'] or '-'}, "
+                      f"{len(e['new_frames'])} frames)")
+    if res["ambiguous"]:
+        print(f"  {len(res['ambiguous'])} ambiguous (left in place, no guessing):")
+        for a in res["ambiguous"]:
+            print(f"    {a['folder']}/{a['enc_id']} {a['frame']} "
+                  f"({a['action']} {a['species'] or '-'}) -- {a['reason']}")
+    total = len(res["entries"])
+    applied = res.get("applied")
+    if applied is not None:
+        print(f"total: {res['n_decisions']} decisions, {res['ok']} already attached, "
+              f"{applied} applied, {len(res['ambiguous'])} ambiguous")
+    else:
+        print(f"total: {res['n_decisions']} decisions, {res['ok']} already attached, "
+              f"{total} to update, {len(res['ambiguous'])} ambiguous")
 
 
 if __name__ == "__main__":

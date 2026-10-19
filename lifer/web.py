@@ -3,9 +3,10 @@
 Flask + Jinja + vanilla JS, no frontend build step, no CDN (works offline).
 State lives in SQLite (data/lifer.sqlite by default): the source of truth for
 review decisions and the imported lifelist. The app reads every runs/<folder>/
-the pipeline has produced, so new trips appear automatically. Decisions are
-keyed by (folder, enc_id, best_frame) so a re-run of a folder does not lose
-them. Nothing under ~/BIRDING is ever touched.
+the pipeline has produced, so new trips appear automatically. Decisions store
+the encounter's frame list and are resolved to a run's encounters by frame
+overlap, so a re-run that renumbers encounters or changes the best frame
+does not lose them (task 25). Nothing under ~/BIRDING is ever touched.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import sqlite3
 import tomllib
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 from flask import (Flask, abort, g, jsonify, render_template, request,
                    send_file)
@@ -29,6 +31,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .boxes import (Box, clear_override, get_box, get_override, get_reid,
                     get_snapshot, set_override, to_list)
+from .decisions import (EncRef, current_encounters, ensure_frames_column,
+                        parse_frames, resolve_decision)
 from .extract import load_photo
 from .home import lifer_home, find_regions_toml, source_folder_for_trip
 from .outputs import CSS, save_crop, save_frame_preview
@@ -60,6 +64,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   species TEXT NOT NULL DEFAULT '',
   scientific TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL DEFAULT '',
+  frames TEXT NOT NULL DEFAULT '', -- JSON list of the encounter's frames (task 25)
   updated_at TEXT NOT NULL,
   PRIMARY KEY (folder, enc_id, best_frame)
 );
@@ -115,6 +120,8 @@ def load_candidates(folder: str) -> list[dict]:
                 "time_end": r["time_end"],
                 "n_frames": int(r["n_frames"]),
                 "best_frame": r["best_frame"],
+                # task 25: the encounter's full frame list (old runs: none)
+                "frames": [x for x in (r.get("frames") or "").split(",") if x],
                 "det_conf": float(r["det_conf"]),
                 "raw_top3": _parse_top3(r["raw_top3"]),
                 "adj_top3": _parse_top3(r["adj_top3"]),
@@ -184,7 +191,8 @@ def _add_nodet_enc(folder: str, entry: dict) -> None:
     if any(e.get("enc_id") == entry.get("enc_id") for e in entries):
         return
     entries.append({k: entry[k] for k in
-                    ("enc_id", "time_start", "time_end", "n_frames", "best_frame")
+                    ("enc_id", "time_start", "time_end", "n_frames", "best_frame",
+                     "frames")
                     if k in entry})
     entries.sort(key=lambda e: str(e.get("time_start", "")))
     _save_nodet_entries(folder, entries)
@@ -198,6 +206,7 @@ def _candidate_fieldnames(folder: str) -> list[str]:
         if names:
             return list(names)
     return ["enc_id", "time_start", "time_end", "n_frames", "best_frame",
+            "frames",
             "det_conf", "raw_top3", "adj_top3", "possible_lifer",
             "lifer_lookalike", "rare_here", "rare_evidence"]
 
@@ -214,6 +223,8 @@ def _insert_candidate_row(folder: str, enc_id: str, base: dict,
         "time_end": base.get("time_end", ""),
         "n_frames": base.get("n_frames", 0),
         "best_frame": base.get("best_frame", ""),
+        "frames": ",".join([str(x) for x in (base.get("frames") or [])]
+                           or ([base["best_frame"]] if base.get("best_frame") else [])),
         "det_conf": f"{float(base.get('det_conf', 0.0)):.3f}",
         "raw_top3": _fmt_top3(fields["raw_top3"]),
         "adj_top3": _fmt_top3(fields["adj_top3"]),
@@ -377,26 +388,30 @@ def _import_lifelist(conn: sqlite3.Connection, csv_path: Path) -> None:
 def _decisions_for(conn: sqlite3.Connection, folder: str) -> dict[tuple[str, str], dict]:
     out: dict[tuple[str, str], dict] = {}
     for r in conn.execute(
-            "SELECT enc_id, best_frame, action, species, scientific, note, updated_at "
+            "SELECT enc_id, best_frame, action, species, scientific, note, frames "
             "FROM decisions WHERE folder=?", (folder,)):
         out[(r["enc_id"], r["best_frame"])] = {
+            "enc_id": r["enc_id"], "best_frame": r["best_frame"],
             "action": r["action"], "species": r["species"],
             "scientific": r["scientific"], "note": r["note"],
-            "updated_at": r["updated_at"],
+            "frames": parse_frames(r["frames"]),
         }
     return out
 
 
 def _upsert_decision(conn: sqlite3.Connection, folder: str, enc_id: str, best_frame: str,
-                     action: str, species: str, scientific: str, note: str) -> None:
+                     action: str, species: str, scientific: str, note: str,
+                     frames: list[str]) -> None:
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
         "INSERT INTO decisions (folder, enc_id, best_frame, action, species, scientific, "
-        "note, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+        "note, frames, updated_at) VALUES (?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(folder, enc_id, best_frame) DO UPDATE SET "
         "action=excluded.action, species=excluded.species, "
-        "scientific=excluded.scientific, note=excluded.note, updated_at=excluded.updated_at",
-        (folder, enc_id, best_frame, action, species, scientific, note, now),
+        "scientific=excluded.scientific, note=excluded.note, "
+        "frames=excluded.frames, updated_at=excluded.updated_at",
+        (folder, enc_id, best_frame, action, species, scientific, note,
+         json.dumps(frames), now),
     )
     conn.commit()
 
@@ -404,6 +419,50 @@ def _upsert_decision(conn: sqlite3.Connection, folder: str, enc_id: str, best_fr
 # ---------------------------------------------------------------------------
 # View models
 # ---------------------------------------------------------------------------
+
+def _enc_refs(folder: str, cands: list[dict[str, Any]],
+              nodet: list[dict[str, Any]]) -> list[EncRef]:
+    """Current encounter references for decision resolution (task 25).
+
+    Runs written before the frames column carry no frame lists in
+    candidates.csv; those are rebuilt from the per-frame cache (same
+    encounter numbering), so decisions still resolve on old trips."""
+    refs = [EncRef(c["enc_id"], c["best_frame"], list(c.get("frames") or []))
+            for c in cands]
+    refs += [EncRef(n["enc_id"], n["best_frame"], list(n.get("frames") or []))
+             for n in nodet if n.get("enc_id")]
+    if any(not r.frames for r in refs):
+        filled = {e.enc_id: e.frames
+                  for e in current_encounters(lifer_home(), folder)}
+        for r in refs:
+            if not r.frames:
+                r.frames = list(filled.get(r.enc_id, []))
+    return refs
+
+
+def _attach_decisions(folder: str, cands: list[dict[str, Any]],
+                      nodet: list[dict[str, Any]],
+                      decs: dict[tuple[str, str], dict[str, Any]]) -> None:
+    """Attach each decision to the current encounter it resolves to (task 25).
+
+    Frame overlap beats the stored (enc_id, best_frame) key, which is only a
+    hint from the run that produced the decision: after a re-detection the
+    same bird may be the same enc_id with a different best frame, or a
+    different enc_id at all. Legacy decisions without a frame list fall back
+    to the exact-key match (their best frame being in the encounter's frames).
+    """
+    refs = _enc_refs(folder, cands, nodet)
+    by_id: dict[str, dict[str, Any]] = {}
+    for d in decs.values():
+        enc, _status = resolve_decision(d["best_frame"], d["frames"], refs)
+        if enc is not None and enc.enc_id not in by_id:
+            by_id[enc.enc_id] = d
+    for c in cands:
+        c["decision"] = by_id.get(c["enc_id"])
+    for n in nodet:
+        if n.get("enc_id"):
+            n["decision"] = by_id.get(n["enc_id"])
+
 
 def _badges(c: dict) -> list[str]:
     b: list[str] = []
@@ -459,9 +518,9 @@ def _enc_view(folder: str, c: dict, decision: dict | None,
 def build_trip(folder: str, conn: sqlite3.Connection) -> dict:
     """Full trip view model: species groups + no-bird frames + decisions."""
     cands = load_candidates(folder)
+    nodet_raw = load_nodet(folder)
     decs = _decisions_for(conn, folder)
-    for c in cands:
-        c["decision"] = decs.get((c["enc_id"], c["best_frame"]))
+    _attach_decisions(folder, cands, nodet_raw, decs)
 
     # group by adjusted top-1 (the species the pipeline is showing)
     by_species: dict[str, list[dict]] = {}
@@ -507,7 +566,7 @@ def build_trip(folder: str, conn: sqlite3.Connection) -> dict:
     # No-detection entries: encounters (nodet.json, task 23) plus, for older
     # runs, lone per-frame thumbnails (no enc id, no fix-crop).
     nodet = []
-    for n in load_nodet(folder):
+    for n in nodet_raw:
         if n.get("enc_id"):
             nodet.append({
                 "id": n["enc_id"],
@@ -517,6 +576,7 @@ def build_trip(folder: str, conn: sqlite3.Connection) -> dict:
                 "best_frame": n.get("best_frame", ""),
                 "thumb": f"/media/{folder}/crops/nodet/{n['enc_id']}.jpg",
                 "enc": True,
+                "decision": n.get("decision"),
             })
         else:
             nodet.append({
@@ -574,12 +634,14 @@ def build_trips(conn: sqlite3.Connection) -> list[dict]:
     out: list[dict] = []
     for folder in list_folders():
         cands = load_candidates(folder)
+        nodet = load_nodet(folder)
         decs = _decisions_for(conn, folder)
+        _attach_decisions(folder, cands, nodet, decs)
         total = len(cands)
-        decided = sum(1 for c in cands if decs.get((c["enc_id"], c["best_frame"])))
+        decided = sum(1 for c in cands if c["decision"])
         pending = sum(1 for c in cands
                       if (c["rare_here"] or c["possible_lifer"])
-                      and not decs.get((c["enc_id"], c["best_frame"])))
+                      and not c["decision"])
         date = min(c["time_start"][:10] for c in cands) if cands else ""
         out.append({
             "folder": folder,
@@ -621,7 +683,7 @@ def _quality_score(enc: dict) -> tuple[float, float]:
     return sharp, conf
 
 
-def _find_candidate(folder: str, enc_id: str):
+def _find_candidate(folder: str, enc_id: str) -> dict[str, Any] | None:
     for c in load_candidates(folder):
         if c["enc_id"] == enc_id:
             return c
@@ -635,6 +697,7 @@ def _find_candidate(folder: str, enc_id: str):
                 "time_end": n.get("time_end", ""),
                 "n_frames": int(n.get("n_frames", 0)),
                 "best_frame": n.get("best_frame", ""),
+                "frames": [str(x) for x in (n.get("frames") or [])],
                 "det_conf": 0.0,
                 "raw_top3": [], "adj_top3": [], "top1": "",
                 "possible_lifer": False, "lifer_lookalike": None,
@@ -834,8 +897,9 @@ def build_sightings(conn: sqlite3.Connection) -> dict[str, dict]:
     # ---- confirmed trip sightings: one per (species, folder) ----
     by_key_folder: dict[tuple[str, str], list[dict]] = {}
     cands_cache: dict[str, list[dict]] = {}
+    refs_cache: dict[str, list[EncRef]] = {}
     for d in conn.execute(
-            "SELECT folder, enc_id, best_frame, species FROM decisions "
+            "SELECT folder, enc_id, best_frame, species, frames FROM decisions "
             "WHERE action IN ('confirm','change')"):
         species = (d["species"] or "").strip()
         if not species:
@@ -846,12 +910,15 @@ def build_sightings(conn: sqlite3.Connection) -> dict[str, dict]:
             if not (RUNS / folder / "candidates.csv").is_file():
                 continue
             cands = cands_cache[folder] = load_candidates(folder)
-        enc = next((c for c in cands
-                    if c["enc_id"] == d["enc_id"] and c["best_frame"] == d["best_frame"]),
-                   None)
-        if enc is None:
+        refs = refs_cache.get(folder)
+        if refs is None:
+            refs = refs_cache[folder] = _enc_refs(folder, cands, [])
+        # task 25: resolve to the current encounter by frame overlap, not by
+        # the exact stored key (a re-detection may have moved the best frame)
+        enc_ref, _status = resolve_decision(d["best_frame"], parse_frames(d["frames"]), refs)
+        if enc_ref is None:
             continue
-        enc = dict(enc)             # don't mutate the shared candidates cache
+        enc = dict(next(c for c in cands if c["enc_id"] == enc_ref.enc_id))
         enc["folder"] = folder
         by_key_folder.setdefault((species.lower(), folder), []).append(enc)
 
@@ -957,6 +1024,7 @@ def create_app(db_path: Path) -> Flask:
     def _open_db():
         g.db = sqlite3.connect(str(db_path))
         g.db.row_factory = sqlite3.Row
+        ensure_frames_column(g.db)
         _import_lifelist(g.db, LIFELIST_CSV)
 
     @app.teardown_request
@@ -1062,8 +1130,14 @@ def create_app(db_path: Path) -> Flask:
         species = (p.get("species") or "").strip()
         if action in ("confirm", "change") and not species:
             return jsonify(ok=False, error="species required"), 400
+        # store the encounter's frame list (task 25): the (enc_id, best_frame)
+        # key is a hint; the frames are how the decision re-attaches after a
+        # re-detection
+        c = _find_candidate(folder, enc_id)
+        frames = list(c.get("frames", [])) if c else ([best_frame] if best_frame else [])
         _upsert_decision(g.db, folder, enc_id, best_frame, action, species,
-                         (p.get("scientific") or "").strip(), (p.get("note") or "").strip())
+                         (p.get("scientific") or "").strip(), (p.get("note") or "").strip(),
+                         frames)
         return jsonify(ok=True)
 
     @app.route("/api/group", methods=["POST"])
@@ -1085,7 +1159,8 @@ def create_app(db_path: Path) -> Flask:
         sci = (p.get("scientific") or "").strip()
         for c in target:
             _upsert_decision(g.db, folder, c["enc_id"], c["best_frame"], action,
-                             species if action == "confirm" else "", sci, "")
+                             species if action == "confirm" else "", sci, "",
+                             c.get("frames", []))
         return jsonify(ok=True, updated=len(target))
 
     @app.route("/api/cropboxes")

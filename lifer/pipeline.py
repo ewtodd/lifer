@@ -350,6 +350,7 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
                 "time_end": enc.end.strftime("%Y-%m-%d %H:%M:%S"),
                 "n_frames": len(enc.frames),
                 "best_frame": best.name,
+                "frames": [f.name for f in enc.frames],
             })
             nodet_frames.update(f.name for f in enc.frames)
             continue
@@ -412,6 +413,7 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
             has_det=True,
             rare_here=rare_here,
             rare_evidence=rare_evidence,
+            frames=[f.name for f in enc.frames],
         ))
         # best crop for the review page (no-detection encounters never get
         # here; they are listed in the "No bird detected" section instead)

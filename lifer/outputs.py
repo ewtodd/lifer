@@ -13,7 +13,7 @@ from __future__ import annotations
 import html
 import csv
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -42,6 +42,7 @@ class Candidate:
     has_det: bool = False
     rare_here: bool = False
     rare_evidence: str = ""
+    frames: list[str] = field(default_factory=list)  # all frames of the encounter (task 25)
 
 
 def save_crop(crop: Image.Image, out_path: Path) -> None:
@@ -75,6 +76,7 @@ def write_candidates_csv(cands: list[Candidate], out_path: Path) -> None:
     with out_path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["enc_id", "time_start", "time_end", "n_frames", "best_frame",
+                    "frames",
                     "det_conf", "raw_top3", "adj_top3", "possible_lifer",
                     "lifer_lookalike", "rare_here", "rare_evidence"])
         for c in cands:
@@ -84,6 +86,7 @@ def write_candidates_csv(cands: list[Candidate], out_path: Path) -> None:
                 c.time_end,
                 c.n_frames,
                 c.best_frame,
+                ",".join(c.frames),
                 f"{c.det_conf:.3f}",
                 "; ".join(f"{n} ({p:.3f})" for n, _s, p in c.raw_top3),
                 "; ".join(f"{n} ({p:.3f})" for n, _s, p in c.adj_top3),

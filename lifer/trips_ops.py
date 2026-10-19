@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .bursts import FrameInfo, group_into_encounters
+from .decisions import ensure_frames_column
 from .home import trip_id_for
 
 if TYPE_CHECKING:
@@ -199,6 +200,7 @@ def plan_migrate_trips(home: Path, conn: sqlite3.Connection | None,
     if conn is None:
         return plan
     conn.row_factory = sqlite3.Row
+    ensure_frames_column(conn)
 
     # Case A: raw-bucket trips X--RAW becoming X.
     for r in rows:
@@ -314,6 +316,7 @@ def plan_migrate_trips(home: Path, conn: sqlite3.Connection | None,
                 "to_trip": target, "to_enc_id": enc_id, "to_frame": enc_best,
                 "action": d["action"], "species": d["species"],
                 "scientific": d["scientific"], "note": d["note"],
+                "frames": d["frames"],
                 "updated_at": d["updated_at"],
             })
     return plan
@@ -367,10 +370,10 @@ def apply_migrate_trips(home: Path, conn: sqlite3.Connection | None,
                 continue
             conn.execute(
                 "INSERT INTO decisions (folder, enc_id, best_frame, action,"
-                " species, scientific, note, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                " species, scientific, note, frames, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
                 (new, d["enc_id"], d["best_frame"], d["action"], d["species"],
-                 d["scientific"], d["note"], d["updated_at"]))
+                 d["scientific"], d["note"], d["frames"], d["updated_at"]))
             conn.execute(
                 "DELETE FROM decisions WHERE folder=? AND enc_id=? "
                 "AND best_frame=?", (old, d["enc_id"], d["best_frame"]))
@@ -397,9 +400,10 @@ def apply_migrate_trips(home: Path, conn: sqlite3.Connection | None,
     for m in plan["map"]:
         conn.execute(
             "INSERT INTO decisions (folder, enc_id, best_frame, action,"
-            " species, scientific, note, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            " species, scientific, note, frames, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
             (m["to_trip"], m["to_enc_id"], m["to_frame"], m["action"],
-             m["species"], m["scientific"], m["note"], m["updated_at"]))
+             m["species"], m["scientific"], m["note"], m.get("frames", ""),
+             m["updated_at"]))
         conn.execute(
             "DELETE FROM decisions WHERE folder=? AND enc_id=? "
             "AND best_frame=?", (m["from"], m["enc_id"], m["frame"]))
