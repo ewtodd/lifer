@@ -1454,16 +1454,14 @@ def create_app(db_path: Path) -> Flask:
             return jsonify(ok=False, error="folder required"), 400
         try:
             dest, copied, skipped = hnd.handoff_frames_for(folder, enc_id or None)
-        except SystemExit as e:
-            return jsonify(ok=False, error=str(e)), 400
-        except RuntimeError as e:
+        except (SystemExit, RuntimeError, OSError, ValueError) as e:
             return jsonify(ok=False, error=str(e)), 400
         if not copied:
             return jsonify(ok=False, error="no confirmed frames to hand off",
                            dest=str(dest)), 400
         try:
             hnd.open_darktable(dest)
-        except RuntimeError as e:
+        except (RuntimeError, OSError) as e:
             return jsonify(ok=False, error=str(e), dest=str(dest),
                            copied=len(copied)), 500
         return jsonify(ok=True, dest=str(dest), copied=len(copied),

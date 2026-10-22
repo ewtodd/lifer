@@ -55,12 +55,17 @@ def deliver_frames(folder: str, source: Path, dest: Path, frames: list[str],
         style = style_sidecar
         if style is None:
             raw = (load_config().get("develop", {}) or {}).get("style_sidecar")
-            style = Path(raw) if isinstance(raw, (str, Path)) else None
+            # an empty/whitespace value means "not set" -- Path("") is ".", so
+            # never turn it into a Path (that would hand develop a directory).
+            if isinstance(raw, (str, Path)) and str(raw).strip():
+                style = Path(raw)
+            else:
+                style = None
         if not style:
             raise RuntimeError(
                 f"{len(missing)} frame(s) need `lifer develop` but no style "
                 "sidecar (--style-sidecar or [develop] style_sidecar in config.toml)")
-        develop(str(source), frames=missing, style_sidecar=Path(style), conn=conn)
+        develop(str(source), frames=missing, style_sidecar=style, conn=conn)
     copied: list[str] = []
     skipped: list[str] = []
     dest.mkdir(parents=True, exist_ok=True)
