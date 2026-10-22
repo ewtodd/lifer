@@ -41,6 +41,26 @@ JPEG_Q = 85
 THUMB_Q = 80
 
 
+def sort_date(d: str) -> str:
+    """A sortable form of a sighting date, for the site to order by: ISO
+    dates as they are, a lifelist date with an unknown day ("8/UNK/2021") as
+    "2021-08", one with only the year known as "2021", and "" when unknown.
+    The displayed dates keep the lifelist's own wording."""
+    d = (d or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        return d
+    parts = d.split("/")
+    if len(parts) != 3 or not parts[2].isdigit():
+        return ""
+    m, day, y = parts
+    year = int(y) + 2000 if len(y) == 2 else int(y)
+    if not m.isdigit():
+        return f"{year:04d}"
+    if not day.isdigit():
+        return f"{year:04d}-{int(m):02d}"
+    return f"{year:04d}-{int(m):02d}-{int(day):02d}"
+
+
 def _slug(name: str) -> str:
     """Filesystem/URL-safe slug for a species common name."""
     s = re.sub(r"[^a-z0-9]+", "-", (name or "").strip().lower()).strip("-")
@@ -231,8 +251,10 @@ def publish(site: Path, db_path: Path) -> dict:
                 "scientific": rec["scientific"],
                 "rank": rank.get(rec["taxon_id"]) if rec["taxon_id"] is not None else None,
                 "count": len(rec["sightings"]),
-                "first": {"date": first["date"], "place": first["place"]},
+                "first": {"date": first["date"], "sort": sort_date(first["date"]),
+                          "place": first["place"]},
                 "latest": {"date": latest_public["date"],
+                           "sort": sort_date(latest_public["date"]),
                            "place": latest_public["place"],
                            "photo": latest_public["photo"]},
                 "latest_photo": latest_photo_public,
