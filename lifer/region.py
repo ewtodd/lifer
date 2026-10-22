@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import json
 import time
+import tomllib
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 import requests
+
+from .home import find_regions_toml
 
 API = "https://api.inaturalist.org/v1"
 AVES = 3
@@ -133,6 +136,36 @@ def species_counts(
         classes.setdefault(tid, Species(taxon_id=tid, scientific=f"taxon_{tid}", common=""))
 
     return classes, alltime_counts, seasonal
+
+
+def lifelist_place_counts(cache_dir: Path) -> tuple[dict[str, dict[int, float]], dict[int, float]]:
+    """All-time counts for every regions.toml place, for lifelist matching.
+
+    Returns ({lowercased region name: {taxon_id: count}}, the counts summed
+    over every region). The lifelist's location column names places the way
+    regions.toml does ("Leon County, FL"), so each entry can be matched
+    against the place it was seen; the sum serves any other location.
+    """
+    regions = tomllib.loads(find_regions_toml().read_text()).get("region", [])
+    by_id: dict[int, dict[int, float]] = {}
+    by_place: dict[str, dict[int, float]] = {}
+    total: dict[int, float] = {}
+    for region in regions:
+        place_id = int(region["place_id"])
+        if place_id not in by_id:
+            try:
+                _, counts, _ = species_counts(place_id, None, cache_dir)
+            except requests.RequestException as e:
+                # only an uncached place can fail; match without it this time
+                print(f"  iNat species counts unavailable for place {place_id}: {e}")
+                continue
+            by_id[place_id] = counts
+            for tid, c in counts.items():
+                total[tid] = total.get(tid, 0) + c
+        name, _short = region_display_names(region, cache_dir)
+        if name:
+            by_place[name.strip().lower()] = by_id[place_id]
+    return by_place, total
 
 
 def normalized(counts: dict[int, float], floor: float = 1.0) -> dict[int, float]:

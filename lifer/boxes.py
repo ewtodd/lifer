@@ -57,6 +57,12 @@ def open_db(db_path: Path | None = None) -> sqlite3.Connection:
         " folder TEXT NOT NULL, frames TEXT NOT NULL, "
         " chosen TEXT NOT NULL, updated_at TEXT NOT NULL, "
         " PRIMARY KEY (folder, frames))")
+    # Frames the owner dropped from their encounter in the review app; the
+    # pipeline leaves them out of the encounter on a re-run.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS removed_frames ("
+        " folder TEXT NOT NULL, frame TEXT NOT NULL, updated_at TEXT NOT NULL, "
+        " PRIMARY KEY (folder, frame))")
     conn.commit()
     return conn
 
@@ -233,6 +239,21 @@ def clear_frame_choice(conn: sqlite3.Connection, folder: str,
     conn.execute("DELETE FROM frame_choice WHERE folder=? AND frames=?",
                  (folder, frames_key(frames)))
     conn.commit()
+
+
+def add_removed_frame(conn: sqlite3.Connection, folder: str, frame: str) -> None:
+    """Record that the owner removed ``frame`` from its encounter."""
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT OR REPLACE INTO removed_frames (folder, frame, updated_at) "
+        "VALUES (?,?,?)", (folder, frame, now))
+    conn.commit()
+
+
+def removed_frames(conn: sqlite3.Connection, folder: str) -> set[str]:
+    """Frames the owner removed from their encounters in ``folder``."""
+    return {r["frame"] for r in conn.execute(
+        "SELECT frame FROM removed_frames WHERE folder=?", (folder,))}
 
 
 def representative_frame(conn: sqlite3.Connection, folder: str,

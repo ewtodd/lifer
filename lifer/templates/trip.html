@@ -605,8 +605,11 @@ async function openDarktable(folder, encId) {
     });
     const j = await r.json().catch(function () { return {}; });
     if (r.ok && j.ok) {
-      flashToast('Opened in darktable \u00b7 ' + j.copied + ' frame' + (j.copied === 1 ? '' : 's') +
-        (j.skipped ? ' \u00b7 ' + j.skipped + ' already there' : ''));
+      const parts = [];
+      if (j.copied) parts.push(j.copied + ' frame' + (j.copied === 1 ? '' : 's') + ' handed off');
+      if (j.skipped) parts.push(j.skipped + ' already there');
+      if (j.missing) parts.push(j.missing + ' missing raw/edit');
+      flashToast(['Opened in darktable'].concat(parts).join(' \u00b7 '), j.missing > 0);
     } else {
       flashToast('Could not open darktable: ' + (j.error || r.status), true);
     }

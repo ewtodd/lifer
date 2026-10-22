@@ -89,14 +89,54 @@ def deliver_frames(folder: str, source: Path, dest: Path, frames: list[str],
     return copied, skipped, missing
 
 
+# How long to watch a fresh darktable for an immediate failure (no display,
+# bad library) before calling the launch good.
+LAUNCH_GRACE_S = 2.0
+# /proc/<pid>/comm of a running darktable: plain, or the Nix wrapper's
+# ".darktable-wrapped" cut to the kernel's 15 characters.
+DARKTABLE_COMMS = ("darktable", ".darktable-wrap")
+
+
+def _darktable_running() -> bool:
+    for comm in Path("/proc").glob("[0-9]*/comm"):
+        try:
+            if comm.read_text().strip() in DARKTABLE_COMMS:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def open_darktable(dest: Path) -> bool:
     """Launch darktable on ``dest`` in the user's desktop session (detached).
-    Returns True once started; raises RuntimeError if darktable isn't on PATH."""
+
+    Returns True once started. Raises RuntimeError if darktable isn't on PATH
+    or exits with an error straight away (e.g. the service has no display);
+    its output goes to LIFER_HOME/darktable.log."""
     exe = shutil.which("darktable")
     if not exe:
         raise RuntimeError("darktable not found on PATH (is it in your Nix profile?)")
-    subprocess.Popen([exe, str(dest)], start_new_session=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # with an instance already up, darktable hands the folder over to it and
+    # exits at once, which is not a failure
+    handing_over = _darktable_running()
+    log = lifer_home() / "darktable.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    # append: an earlier darktable may still be writing to the same log
+    with log.open("ab") as out:
+        start = out.tell()
+        proc = subprocess.Popen([exe, str(dest)], start_new_session=True,
+                                stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT)
+    try:
+        code = proc.wait(timeout=LAUNCH_GRACE_S)
+    except subprocess.TimeoutExpired:
+        return True  # still running: darktable is up
+    if code != 0 and not handing_over:
+        with log.open("rb") as f:
+            f.seek(start)
+            lines = f.read().decode(errors="replace").strip().splitlines()
+        detail = lines[-1] if lines else "no output"
+        raise RuntimeError(f"darktable exited with status {code}: {detail} (see {log})")
     return True
 
 
@@ -106,7 +146,6 @@ def handoff_frames_for(folder: str, enc_id: str | None = None,
     """Resolve ``folder``'s confirmed frames (or just ``enc_id``'s), develop any
     missing edits, and copy them into ``dest`` (default ~/Pictures/<folder>).
     Returns (dest, copied, skipped); raises on refusal or missing style."""
-    conn = open_db(db_path)
     source = source_folder_for_trip(folder)
     if dest is None:
         dest = _dest_for(folder)
@@ -116,18 +155,22 @@ def handoff_frames_for(folder: str, enc_id: str | None = None,
                          "(under the read-only photo share / source folder)")
     if dest.is_file():
         raise SystemExit(f"error: destination {dest} is a file, not a folder")
-    encs = [e for e in confirmed_encounters(conn, folder)
-            if not enc_id or e.enc_id == enc_id]
-    chosen: list[str] = []
-    for enc in encs:
-        f = representative_frame(conn, folder, enc.frames, enc.best_frame)
-        if f and f not in chosen:
-            chosen.append(f)
-    if not chosen:
-        return dest, [], []
-    copied, skipped, _missing = deliver_frames(folder, source, dest, chosen,
-                                               style_sidecar, conn)
-    return dest, copied, skipped
+    conn = open_db(db_path)
+    try:
+        encs = [e for e in confirmed_encounters(conn, folder)
+                if not enc_id or e.enc_id == enc_id]
+        chosen: list[str] = []
+        for enc in encs:
+            f = representative_frame(conn, folder, enc.frames, enc.best_frame)
+            if f and f not in chosen:
+                chosen.append(f)
+        if not chosen:
+            return dest, [], []
+        copied, skipped, _missing = deliver_frames(folder, source, dest, chosen,
+                                                   style_sidecar, conn)
+        return dest, copied, skipped
+    finally:
+        conn.close()
 
 
 def confirmed_encounters(conn: sqlite3.Connection, folder: str) -> list[EncRef]:

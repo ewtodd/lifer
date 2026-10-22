@@ -104,3 +104,65 @@ def test_is_within():
     assert handoff._is_within(Path("/a/b/c"), Path("/a/b"))
     assert not handoff._is_within(Path("/a/b"), Path("/a/b/c"))
     assert handoff._is_within(Path("/x/y"), Path("/x/y"))
+
+
+# ---------------------------------------------------------------------------
+# "Open in darktable" from the review app
+# ---------------------------------------------------------------------------
+
+def test_web_open_darktable_reopens_frames_already_handed_off(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    monkeypatch.setenv("LIFER_HOME", str(home))
+    db = home / "data" / "lifer.sqlite"
+    make_db(db).close()
+    dest = tmp_path / "Pictures" / "TRIP"
+    dest.mkdir(parents=True)
+    (dest / "_DSC0001.NEF").write_bytes(b"raw")     # handed off on an earlier click
+    calls = {}
+
+    def fake_handoff(folder, enc_id=None, db_path=None):
+        calls["db_path"] = db_path
+        return dest, [], ["_DSC0001.NEF", "_DSC0002.NEF"]   # 0002: raw missing
+
+    monkeypatch.setattr(handoff, "handoff_frames_for", fake_handoff)
+    monkeypatch.setattr(handoff, "open_darktable", lambda d: calls.setdefault("opened", d))
+    app = web.create_app(db)
+    app.config["TESTING"] = True
+    r = app.test_client().post("/api/open_darktable", json={"folder": "TRIP"})
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json() == {"ok": True, "dest": str(dest), "copied": 0,
+                            "skipped": 1, "missing": 1}
+    assert calls["opened"] == dest
+    assert calls["db_path"] == db       # the app's DB, not the default one
+
+
+def _launch(monkeypatch, tmp_path, dest, running=False):
+    """open_darktable with Python standing in for darktable: ``python <dir>``
+    runs <dir>/__main__.py, or exits 1 at once when there is none."""
+    import sys
+    monkeypatch.setenv("LIFER_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(handoff.shutil, "which", lambda _name: sys.executable)
+    monkeypatch.setattr(handoff, "_darktable_running", lambda: running)
+    monkeypatch.setattr(handoff, "LAUNCH_GRACE_S", 0.5)
+    return handoff.open_darktable(dest)
+
+
+def test_open_darktable_reports_an_immediate_failure(monkeypatch, tmp_path):
+    dest = tmp_path / "TRIP"
+    dest.mkdir()
+    with pytest.raises(RuntimeError, match="exited with status 1"):
+        _launch(monkeypatch, tmp_path, dest)
+    assert (tmp_path / "home" / "darktable.log").is_file()
+
+
+def test_open_darktable_hand_over_to_running_instance_is_ok(monkeypatch, tmp_path):
+    dest = tmp_path / "TRIP"
+    dest.mkdir()
+    assert _launch(monkeypatch, tmp_path, dest, running=True) is True
+
+
+def test_open_darktable_still_running_is_ok(monkeypatch, tmp_path):
+    dest = tmp_path / "TRIP"
+    dest.mkdir()
+    (dest / "__main__.py").write_text("import time; time.sleep(2)\n")
+    assert _launch(monkeypatch, tmp_path, dest) is True

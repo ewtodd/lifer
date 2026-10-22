@@ -21,15 +21,21 @@ class FrameInfo:
     sharpness: float  # Laplacian variance of the best bird crop; -1 if none
 
 
-def _best_frame_key(f: FrameInfo) -> tuple[float, str]:
+def best_frame_key(name: str, sharpness: float) -> tuple[float, str]:
+    """Sort key for an encounter's best frame (max wins); the review app uses
+    it too when a removed frame forces a new pick."""
     # Sharpness is a Laplacian variance of the bird crop, and the crop
     # depends on the detector box, which is not bit-stable across re-runs
     # on CUDA. Two frames within ~1% of each other differ in the box, not
     # in focus, so quantise log10(sharpness) to two decimals (one step is
     # ~1% relative) and break ties by filename: the best-frame choice is
     # then stable across re-detections (task 25).
-    q = float("-inf") if f.sharpness <= 0 else round(math.log10(f.sharpness) * 100)
-    return (q, f.name)
+    q = float("-inf") if sharpness <= 0 else round(math.log10(sharpness) * 100)
+    return (q, name)
+
+
+def _best_frame_key(f: FrameInfo) -> tuple[float, str]:
+    return best_frame_key(f.name, f.sharpness)
 
 
 @dataclass

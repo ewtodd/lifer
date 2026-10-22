@@ -19,7 +19,7 @@ import json
 import os
 import sqlite3
 import tomllib
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +29,11 @@ from PIL import Image
 from rapidfuzz import fuzz, process
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from .boxes import (Box, clear_override, get_box, get_frame_choice,
-                    get_override, get_reid, get_snapshot,
-                    representative_frame, set_frame_choice, set_override,
-                    to_list)
+from .boxes import (Box, add_removed_frame, clear_frame_choice, clear_override,
+                    get_box, get_frame_choice, get_override, get_reid,
+                    get_snapshot, representative_frame, set_frame_choice,
+                    set_override, to_list)
+from .bursts import best_frame_key
 from .decisions import (EncRef, current_encounters, ensure_frames_column,
                         parse_frames, resolve_decision)
 from .extract import load_photo
@@ -98,6 +99,12 @@ CREATE TABLE IF NOT EXISTS frame_choice (
   chosen TEXT NOT NULL,     -- the representative frame the owner picked (task 12)
   updated_at TEXT NOT NULL,
   PRIMARY KEY (folder, frames)
+);
+CREATE TABLE IF NOT EXISTS removed_frames (
+  folder TEXT NOT NULL,
+  frame TEXT NOT NULL,      -- dropped from its encounter; re-runs leave it out
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (folder, frame)
 );
 """
 
@@ -922,8 +929,9 @@ def _rewrite_candidate(folder: str, enc_id: str, fields: dict) -> None:
 
 def _remove_candidate_frame(folder: str, enc_id: str, frame: str) -> tuple[list[str], str]:
     """Drop ``frame`` from an encounter's frame set in candidates.csv, updating
-    ``frames``/``n_frames`` and re-picking ``best_frame`` if it was removed.
-    Returns (new_frames, new_best). Raises ValueError if the frame isn't there."""
+    ``frames``/``n_frames`` and, if the best frame was removed, re-picking it
+    by the pipeline's rule (sharpest bird crop). Returns (new_frames,
+    best_frame). Raises ValueError if the frame isn't there or is the last."""
     path = RUNS / folder / "candidates.csv"
     with path.open(newline="") as f:
         reader = csv.DictReader(f)
@@ -932,28 +940,33 @@ def _remove_candidate_frame(folder: str, enc_id: str, frame: str) -> tuple[list[
             "det_conf", "raw_top3", "adj_top3", "possible_lifer",
             "lifer_lookalike", "rare_here", "rare_evidence"]
         rows = list(reader)
-    new_best = None
-    target = None
-    for r in rows:
-        if r["enc_id"] == enc_id:
-            frames = [x for x in (r.get("frames") or "").split(",") if x]
-            if frame not in frames:
-                raise ValueError(f"{frame} is not in encounter {enc_id}")
-            new_frames = [x for x in frames if x != frame]
-            r["frames"] = ",".join(new_frames)
-            r["n_frames"] = str(len(new_frames))
-            if r["best_frame"] == frame:
-                r["best_frame"] = new_frames[0] if new_frames else frame
-                new_best = r["best_frame"]
-            target = new_frames
-            break
-    if target is None:
+    row = next((r for r in rows if r["enc_id"] == enc_id), None)
+    if row is None:
         raise ValueError(f"unknown encounter {enc_id}")
+    frames = [x for x in (row.get("frames") or "").split(",") if x]
+    if frame not in frames:
+        raise ValueError(f"{frame} is not in encounter {enc_id}")
+    new_frames = [x for x in frames if x != frame]
+    if not new_frames:
+        raise ValueError("cannot remove the only frame")
+    row["frames"] = ",".join(new_frames)
+    row["n_frames"] = str(len(new_frames))
+    if row["best_frame"] == frame:
+        row["best_frame"] = _pick_best_frame(folder, new_frames)
     with path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
-    return target, new_best or ""
+    return new_frames, row["best_frame"]
+
+
+def _pick_best_frame(folder: str, frames: list[str]) -> str:
+    """The pipeline's best frame among ``frames`` (bursts.best_frame_key over
+    the per-frame cache's bird-crop sharpness)."""
+    def key(name: str) -> tuple[float, str]:
+        sharp = float((_frame_cache(folder, name) or {}).get("sharpness", -1.0))
+        return best_frame_key(name, sharp)
+    return max(frames, key=key)
 
 
 def _snapshot_fields(c: dict) -> str:
@@ -1014,6 +1027,26 @@ def _sighting_view(s: dict, conn: sqlite3.Connection) -> str | None:
     frame = representative_frame(conn, folder,
                                  enc.get("frames") or [], enc["best_frame"])
     return f"/media/{folder}/crops/frames/{frame}.jpg"
+
+
+# Days of slack around a trip when deciding whether an ODS row records the
+# same visit: lifelist rows were typed up by hand, sometimes a day off.
+FOLD_SLACK_DAYS = 1
+
+
+def _trip_days(cands: list[dict]) -> tuple[date, date] | None:
+    """First and last day a trip's encounters were photographed."""
+    days = [d for c in cands
+            for d in (_parse_date((c.get("time_start") or "")[:10]),
+                      _parse_date((c.get("time_end") or "")[:10])) if d]
+    return (min(days), max(days)) if days else None
+
+
+def _during_trip(day: date, span: tuple[date, date] | None) -> bool:
+    if span is None:
+        return False
+    slack = timedelta(days=FOLD_SLACK_DAYS)
+    return span[0] - slack <= day <= span[1] + slack
 
 
 def build_sightings(conn: sqlite3.Connection) -> dict[str, dict]:
@@ -1105,6 +1138,7 @@ def build_sightings(conn: sqlite3.Connection) -> dict[str, dict]:
         enc["frames"] = list(enc_ref.frames) or list(enc.get("frames") or [])
         by_key_folder.setdefault((species.lower(), folder), []).append(enc)
 
+    trip_days = {folder: _trip_days(cands) for folder, cands in cands_cache.items()}
     for (key, folder), encs in by_key_folder.items():
         encs.sort(key=_quality_score, reverse=True)
         best = encs[0]
@@ -1134,26 +1168,26 @@ def build_sightings(conn: sqlite3.Connection) -> dict[str, dict]:
             # This species is on the historical lifelist, so it's never "new",
             # even when every ODS row folds into a trip.
             entry["_has_ods"] = True
-            trip_places = {t["place"] for t in trips}
-            folded = [o for o in ods if o["place"] in trip_places]
-            kept_ods = [o for o in ods if o["place"] not in trip_places]
-            # Fold an ODS row into the confirmed trip at the same place so the
-            # same observation isn't counted twice. Keep the earliest date
-            # so `first` reflects the ODS record where it predates the photo.
-            for o in folded:
-                best, best_delta = None, None
-                for t in trips:
-                    if t["place"] != o["place"]:
-                        continue
-                    od = o["date_dt"]; td = t["date_dt"]
-                    delta = abs((td - od).days) if (od and td) else 10 ** 9
-                    if best is None or delta < best_delta:
-                        best, best_delta = t, delta
-                if best is not None:
-                    od = o["date_dt"]; bd = best["date_dt"]
-                    if od and (bd is None or od < bd):
-                        best["date_dt"] = od
-                        best["date"] = o["date"]
+            # Fold an ODS row into a confirmed trip only when it records that
+            # same visit: same place AND dated within the trip's days. Places
+            # are counties, so a row from another visit there (months or years
+            # apart) stays its own sighting rather than re-dating the photo.
+            # Within the visit keep the earliest date, so `first` reflects the
+            # ODS record where it predates the photo.
+            kept_ods = []
+            for o in ods:
+                od = o["date_dt"]
+                same_visit = [t for t in trips
+                              if t["place"] == o["place"] and od is not None
+                              and _during_trip(od, trip_days.get(t["folder"]))]
+                if not same_visit:
+                    kept_ods.append(o)
+                    continue
+                best = min(same_visit, key=lambda t: abs((t["date_dt"] - od).days)
+                           if t["date_dt"] else 10 ** 9)
+                if best["date_dt"] is None or od < best["date_dt"]:
+                    best["date_dt"] = od
+                    best["date"] = o["date"]
             entry["sightings"] = kept_ods + trips
         s = entry["sightings"]
         s.sort(key=lambda x: (x["date_dt"] or date.min, x["source"]), reverse=True)
@@ -1453,24 +1487,32 @@ def create_app(db_path: Path) -> Flask:
         if not folder:
             return jsonify(ok=False, error="folder required"), 400
         try:
-            dest, copied, skipped = hnd.handoff_frames_for(folder, enc_id or None)
+            dest, copied, skipped = hnd.handoff_frames_for(
+                folder, enc_id or None, db_path=db_path)
         except (SystemExit, RuntimeError, OSError, ValueError) as e:
             return jsonify(ok=False, error=str(e)), 400
-        if not copied:
-            return jsonify(ok=False, error="no confirmed frames to hand off",
-                           dest=str(dest)), 400
+        # A frame handed off earlier is skipped (never overwritten) but is
+        # already in dest, so a second click just opens darktable again.
+        present = [f for f in skipped if (dest / f).is_file()]
+        missing = [f for f in skipped if f not in present]
+        if not copied and not present:
+            error = ("no confirmed frames to hand off" if not missing else
+                     f"could not hand off {', '.join(missing)} "
+                     "(raw or lifer edit missing)")
+            return jsonify(ok=False, error=error, dest=str(dest)), 400
         try:
             hnd.open_darktable(dest)
         except (RuntimeError, OSError) as e:
             return jsonify(ok=False, error=str(e), dest=str(dest),
                            copied=len(copied)), 500
         return jsonify(ok=True, dest=str(dest), copied=len(copied),
-                       skipped=len(skipped))
+                       skipped=len(present), missing=len(missing))
 
     @app.route("/api/frame/remove", methods=["POST"])
     def api_frame_remove():
         """Drop a bad frame from an encounter's frame set (rewrites its row in
-        candidates.csv; re-picks best_frame if it was removed)."""
+        candidates.csv; re-picks best_frame if it was removed). The removal is
+        recorded in the DB so a re-run leaves the frame out too."""
         p = request.get_json(force=True) or {}
         folder = p.get("folder") or ""
         enc_id = p.get("enc_id") or ""
@@ -1486,12 +1528,19 @@ def create_app(db_path: Path) -> Flask:
         if len(frames) <= 1:
             return jsonify(
                 ok=False,
-                error="cannot remove the only frame; mark the encounter not-a-bird"),
-            400
+                error="cannot remove the only frame; mark the encounter not-a-bird"), 400
+        chosen = get_frame_choice(g.db, folder, frames)
         try:
             new_frames, new_best = _remove_candidate_frame(folder, enc_id, frame)
         except ValueError as e:
             return jsonify(ok=False, error=str(e)), 400
+        add_removed_frame(g.db, folder, frame)
+        # the owner's photo pick is keyed by the encounter's frame set: move it
+        # to the new set (or drop it, if the removed frame was the pick)
+        if chosen:
+            clear_frame_choice(g.db, folder, frames)
+            if chosen != frame:
+                set_frame_choice(g.db, folder, new_frames, chosen)
         return jsonify(ok=True, frames=sorted(new_frames), best_frame=new_best)
 
     @app.route("/api/crop", methods=["POST"])

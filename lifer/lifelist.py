@@ -102,15 +102,28 @@ def parse_lifelist(path: Path) -> list[list[str]]:
     return data
 
 
-def match_lifelist(entries: list[list[str]], taxa: list[Taxon],
-                   cutoff: int = 80, region_ids: set[int] | None = None) -> list[LifeEntry]:
+# How close to the outright best a fuzzy score must be to count as a near-tie.
+# A split pair scores the same against the old name ("Herring Gull" is 90
+# against both European and American Herring Gull); a different species that
+# merely shares a word scores well below.
+NEAR_TIE = 3
+
+
+def match_lifelist(entries: list[list[str]], taxa: list[Taxon], cutoff: int = 80,
+                   counts_by_place: dict[str, dict[int, float]] | None = None,
+                   default_counts: dict[int, float] | None = None) -> list[LifeEntry]:
     """Fuzzy-match each typed species name to an Aves taxon by common name.
 
     Scientific names in the lifelist also match: we key the candidate table on
-    both common and scientific names so either input form resolves. When
-    ``region_ids`` is given (the taxa observed in the region being run), a
-    near-tie is resolved toward the taxon that actually occurs there, which
-    handles recent taxonomic splits (e.g. European vs American Herring Gull).
+    both common and scientific names so either input form resolves.
+
+    A near-tie (a recent split typed under the old name, e.g. European vs
+    American Herring Gull) is resolved toward the taxon most observed where
+    the entry was seen: ``counts_by_place`` maps a lowercased location as the
+    lifelist writes it ("leon county, fl") to iNat observation counts per
+    taxon id, and ``default_counts`` serves locations not in it. Each entry
+    uses its own location, so the result never depends on which trip is
+    being run. An exact name match is never overridden.
     """
     # candidate table: name -> taxon. Common names are the primary key;
     # scientific names included as secondary candidates.
@@ -120,14 +133,14 @@ def match_lifelist(entries: list[list[str]], taxa: list[Taxon],
             candidates[t.common.lower()] = t
         candidates[t.scientific.lower()] = t
     keys = list(candidates.keys())
-    region = set(region_ids) if region_ids else None
+    by_place = counts_by_place or {}
 
     out: list[LifeEntry] = []
     for typed, date, location, _details in entries:
         if not typed:
             continue
         # WRatio is case-sensitive; keys are lowercase, so lowercase the query.
-        # Keep the top handful so a region-appropriate taxon can win a near-tie.
+        # Keep the top handful so a near-tied taxon can still win below.
         top = process.extract(typed.lower(), keys, scorer=fuzz.WRatio,
                               score_cutoff=cutoff, limit=8)
         if not top:
@@ -137,14 +150,15 @@ def match_lifelist(entries: list[list[str]], taxa: list[Taxon],
         best_name, best_score, _ = top[0]
         chosen = candidates[best_name]
         chosen_score = best_score
-        if region:
-            # Prefer a taxon that occurs here if it scores within a small
-            # tolerance of the outright best (a split pair is nearly tied).
-            for name, score, _ in top:
-                if score >= best_score - 3 and candidates[name].id in region:
-                    chosen = candidates[name]
-                    chosen_score = score
-                    break
+        counts = by_place.get(location.strip().lower(), default_counts)
+        if counts and best_score < 100:
+            near = [(candidates[name], score) for name, score, _ in top
+                    if score >= best_score - NEAR_TIE]
+            # max() keeps the first (best-scoring) of equally observed taxa
+            n_obs, taxon, score = max(((counts.get(t.id, 0), t, s) for t, s in near),
+                                      key=lambda x: x[0])
+            if n_obs > 0:
+                chosen, chosen_score = taxon, score
         out.append(LifeEntry(typed=typed, date=date, location=location,
                              taxon=chosen, score=chosen_score))
     return out

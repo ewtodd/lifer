@@ -67,3 +67,46 @@ def test_parse_lifelist_normalises_dates(tmp_path):
     # other columns untouched
     assert [r[0] for r in rows] == ["American Crow", "Brown Pelican",
                                     "Canada Goose"]
+
+
+# ---------------------------------------------------------------------------
+# match_lifelist: near-tied splits resolve by the entry's own location
+# ---------------------------------------------------------------------------
+
+from lifer.lifelist import match_lifelist  # noqa: E402
+from lifer.taxonomy import Taxon  # noqa: E402
+
+EUROPEAN = Taxon(id=1, scientific="Larus argentatus", common="European Herring Gull")
+AMERICAN = Taxon(id=2, scientific="Larus smithsonianus", common="American Herring Gull")
+TAXA = [EUROPEAN, AMERICAN]
+
+
+def _gull(location, by_place=None, default=None, typed="Herring Gull"):
+    [e] = match_lifelist([[typed, "07/09/21", location, ""]], TAXA,
+                         counts_by_place=by_place, default_counts=default)
+    return e.taxon
+
+
+def test_split_without_counts_keeps_outright_best():
+    # both names score the same; with nothing to go on the first one wins
+    assert _gull("Manitowoc County, WI") is EUROPEAN
+
+
+def test_split_resolves_by_the_entry_location():
+    by_place = {"manitowoc county, wi": {2: 900}, "norfolk, uk": {1: 500}}
+    assert _gull("Manitowoc County, WI", by_place) is AMERICAN
+    assert _gull("Norfolk, UK", by_place) is EUROPEAN
+
+
+def test_split_prefers_the_more_observed_taxon_when_both_occur():
+    # a few vagrant records of the European bird must not decide it
+    assert _gull("Henderson County, NC", {"henderson county, nc": {1: 3, 2: 400}}) is AMERICAN
+
+
+def test_unknown_location_uses_default_counts():
+    assert _gull("TM", {"leon county, fl": {1: 5}}, default={2: 10}) is AMERICAN
+
+
+def test_exact_name_is_never_overridden():
+    assert _gull("Manitowoc County, WI", {"manitowoc county, wi": {2: 900}},
+                 typed="European Herring Gull") is EUROPEAN

@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 
 from .bioclip import BioCLIP, label_text
-from .boxes import get_box, open_db
+from .boxes import get_box, open_db, removed_frames
 from .bursts import Encounter, FrameInfo, group_into_encounters
 from .detect import (BirdDetector, Detection, FrameDetections, sharpness,
                      square_crop, usable_crop)
@@ -31,7 +31,8 @@ from .home import effective_trip_id, find_regions_toml, lifer_home
 from .lifelist import (LifeEntry, lifer_set, match_lifelist, parse_lifelist,
                        write_lifelist_csv)
 from .outputs import Candidate, save_crop, save_frame_preview, write_candidates_csv, write_review_html
-from .region import normalized, region_display_names, species_counts
+from .region import (lifelist_place_counts, normalized, region_display_names,
+                     species_counts)
 from .taxonomy import aves_species
 
 LIFELIST = Path.home() / "BIRDING" / "LIFELIST.ods"
@@ -245,10 +246,12 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
     t0 = time.time()
     taxa = aves_species(inat_cache)
     entries = parse_lifelist(LIFELIST)
-    # the region's observed species lets a near-tied fuzzy match resolve toward
-    # the taxon that actually occurs here (e.g. American not European Herring Gull)
-    region_classes, _, _ = species_counts(place_id, None, inat_cache)
-    matched = match_lifelist(entries, taxa, region_ids=set(region_classes.keys()))
+    # each entry's own location settles a near-tied fuzzy match (American not
+    # European Herring Gull in Wisconsin); lifelist.csv is shared by every
+    # trip, so it must not depend on the region being run
+    place_counts, all_counts = lifelist_place_counts(inat_cache)
+    matched = match_lifelist(entries, taxa, counts_by_place=place_counts,
+                             default_counts=all_counts)
     write_lifelist_csv(matched, home / "data" / "lifelist.csv")
     lifers = lifer_set(matched)
     n_unmatched = sum(1 for e in matched if e.taxon is None)
@@ -285,6 +288,11 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
                        best_conf=r.dets.best.conf if r.dets.best else 0.0,
                        sharpness=r.sharpness) for r in records.values()]
     encounters = group_into_encounters(infos, gap_seconds)
+    # Frames the owner removed in the review app stay out of their encounter.
+    # Dropped after grouping, so the encounters (and their IDs) don't shift.
+    removed = removed_frames(db_conn, name)
+    for enc in encounters:
+        enc.frames = [f for f in enc.frames if f.name not in removed]
     timings["group"] = time.time() - t0
     print(f"encounters: {len(encounters)} (gap {gap_seconds:g}s) "
           f"[{timings['group']:.1f}s]")
@@ -330,6 +338,8 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
     order = sorted(classes)
     for i, enc in enumerate(encounters, 1):
         enc_id = f"enc_{i:04d}"
+        if not enc.frames:
+            continue  # every frame removed by the owner
         best = enc.best_frame
         rec = records[best.name]
         has_det = any(f.n_dets > 0 for f in enc.frames)
@@ -453,7 +463,7 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
     # individual no-detection frames inside an encounter that has detected
     # frames (the encounter itself is classified on its detected frames)
     for r in records.values():
-        if r.dets.dets or r.name in nodet_frames:
+        if r.dets.dets or r.name in nodet_frames or r.name in removed:
             continue
         image = jpeg_to_image(r._jpeg) if r._jpeg else load_photo(r.path)
         thumb_rel = f"crops/nodet/{r.name.rsplit('.', 1)[0]}.jpg"

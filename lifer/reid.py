@@ -118,7 +118,8 @@ def identify_crop(folder: str, frame: str, crop) -> dict:
     only the image encoder, loaded on the CPU.
     """
     from .lifelist import lifer_set, match_lifelist, parse_lifelist
-    from .region import normalized, region_display_names, species_counts
+    from .region import (lifelist_place_counts, normalized,
+                         region_display_names, species_counts)
     from .taxonomy import aves_species
 
     home = lifer_home()
@@ -141,7 +142,10 @@ def identify_crop(folder: str, frame: str, crop) -> dict:
     window_label = f"{calendar.month_abbr[first]}\u2013{calendar.month_abbr[last]}"
 
     taxa = aves_species(inat_cache)
-    matched = match_lifelist(parse_lifelist(LIFELIST), taxa)
+    # same per-location matching as the pipeline, so both agree on the lifers
+    place_counts, all_counts = lifelist_place_counts(inat_cache)
+    matched = match_lifelist(parse_lifelist(LIFELIST), taxa,
+                             counts_by_place=place_counts, default_counts=all_counts)
     lifers = lifer_set(matched)
 
     order = sorted(classes)
