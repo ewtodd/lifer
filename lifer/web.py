@@ -34,8 +34,9 @@ from .boxes import (Box, add_removed_frame, clear_frame_choice, clear_override,
                     get_snapshot, representative_frame, set_frame_choice,
                     set_override, to_list)
 from .bursts import best_frame_key
-from .decisions import (EncRef, current_encounters, ensure_frames_column,
-                        parse_frames, resolve_decision)
+from .decisions import (EncRef, bird_box_json, current_encounters,
+                        ensure_bird_box_column, ensure_frames_column,
+                        parse_boxes, parse_frames, resolve_decision)
 from .extract import load_photo
 from .home import lifer_home, find_regions_toml, source_folder_for_trip
 from .outputs import CSS, save_crop, save_frame_preview
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   scientific TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL DEFAULT '',
   frames TEXT NOT NULL DEFAULT '', -- JSON list of the encounter's frames (task 25)
+  bird_box TEXT NOT NULL DEFAULT '', -- JSON [frame,x1,y1,x2,y2] for an extra bird, '' for the primary
   updated_at TEXT NOT NULL,
   PRIMARY KEY (folder, enc_id, best_frame)
 );
@@ -106,6 +108,16 @@ CREATE TABLE IF NOT EXISTS removed_frames (
   frame TEXT NOT NULL,      -- dropped from its encounter; re-runs leave it out
   updated_at TEXT NOT NULL,
   PRIMARY KEY (folder, frame)
+);
+CREATE TABLE IF NOT EXISTS added_birds (
+  folder TEXT NOT NULL,
+  frame TEXT NOT NULL,      -- a bird the owner drew; always its own extra bird
+  x1 REAL NOT NULL,
+  y1 REAL NOT NULL,
+  x2 REAL NOT NULL,
+  y2 REAL NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (folder, frame, x1, y1, x2, y2)
 );
 """
 
@@ -146,6 +158,10 @@ def load_candidates(folder: str) -> list[dict]:
                 "lifer_lookalike": r["lifer_lookalike"] or None,
                 "rare_here": r["rare_here"] == "True",
                 "rare_evidence": (r.get("rare_evidence") or "").strip(),
+                # several species in one burst: 0 = the burst's primary bird;
+                # extra birds carry their own box per frame (absent in old runs)
+                "bird": int(r.get("bird") or 0),
+                "boxes": parse_boxes(r.get("boxes")),
             })
     rows.sort(key=lambda c: c["time_start"])
     return rows
@@ -223,7 +239,7 @@ def _candidate_fieldnames(folder: str) -> list[str]:
         if names:
             return list(names)
     return ["enc_id", "time_start", "time_end", "n_frames", "best_frame",
-            "frames",
+            "frames", "bird", "boxes",
             "det_conf", "raw_top3", "adj_top3", "possible_lifer",
             "lifer_lookalike", "rare_here", "rare_evidence"]
 
@@ -403,34 +419,47 @@ def _import_lifelist(conn: sqlite3.Connection, csv_path: Path) -> None:
 
 
 def _decisions_for(conn: sqlite3.Connection, folder: str) -> dict[tuple[str, str], dict]:
+    ensure_bird_box_column(conn)
     out: dict[tuple[str, str], dict] = {}
     for r in conn.execute(
-            "SELECT enc_id, best_frame, action, species, scientific, note, frames "
+            "SELECT enc_id, best_frame, action, species, scientific, note, frames, bird_box "
             "FROM decisions WHERE folder=?", (folder,)):
         out[(r["enc_id"], r["best_frame"])] = {
             "enc_id": r["enc_id"], "best_frame": r["best_frame"],
             "action": r["action"], "species": r["species"],
             "scientific": r["scientific"], "note": r["note"],
             "frames": parse_frames(r["frames"]),
+            "bird_box": r["bird_box"],
         }
     return out
 
 
 def _upsert_decision(conn: sqlite3.Connection, folder: str, enc_id: str, best_frame: str,
                      action: str, species: str, scientific: str, note: str,
-                     frames: list[str]) -> None:
+                     frames: list[str], bird_box: str = "") -> None:
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
         "INSERT INTO decisions (folder, enc_id, best_frame, action, species, scientific, "
-        "note, frames, updated_at) VALUES (?,?,?,?,?,?,?,?,?) "
+        "note, frames, bird_box, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(folder, enc_id, best_frame) DO UPDATE SET "
         "action=excluded.action, species=excluded.species, "
         "scientific=excluded.scientific, note=excluded.note, "
-        "frames=excluded.frames, updated_at=excluded.updated_at",
+        "frames=excluded.frames, bird_box=excluded.bird_box, "
+        "updated_at=excluded.updated_at",
         (folder, enc_id, best_frame, action, species, scientific, note,
-         json.dumps(frames), now),
+         json.dumps(frames), bird_box, now),
     )
     conn.commit()
+
+
+def _bird_box_of(c: dict | None) -> str:
+    """decisions.bird_box for a candidate row: the extra bird's best-frame box,
+    set server-side so the client never has to know about it; '' for a
+    burst's primary bird."""
+    if not c or not c.get("bird"):
+        return ""
+    box = (c.get("boxes") or {}).get(c["best_frame"])
+    return bird_box_json(c["best_frame"], box) if box else ""
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +473,8 @@ def _enc_refs(folder: str, cands: list[dict[str, Any]],
     Runs written before the frames column carry no frame lists in
     candidates.csv; those are rebuilt from the per-frame cache (same
     encounter numbering), so decisions still resolve on old trips."""
-    refs = [EncRef(c["enc_id"], c["best_frame"], list(c.get("frames") or []))
+    refs = [EncRef(c["enc_id"], c["best_frame"], list(c.get("frames") or []),
+                   bird=c.get("bird", 0), boxes=dict(c.get("boxes") or {}))
             for c in cands]
     refs += [EncRef(n["enc_id"], n["best_frame"], list(n.get("frames") or []))
              for n in nodet if n.get("enc_id")]
@@ -473,7 +503,8 @@ def _attach_decisions(folder: str, cands: list[dict[str, Any]],
     refs = _enc_refs(folder, cands, nodet)
     by_id: dict[str, dict[str, Any]] = {}
     for d in decs.values():
-        enc, _status = resolve_decision(d["best_frame"], d["frames"], refs)
+        enc, _status = resolve_decision(d["best_frame"], d["frames"], refs,
+                                        d.get("bird_box", ""))
         if enc is not None and enc.enc_id not in by_id:
             by_id[enc.enc_id] = d
     for c in cands:
@@ -1062,6 +1093,7 @@ def build_sightings(conn: sqlite3.Connection) -> dict[str, dict]:
     of that trip ordered by quality, so publish can fall back if the best frame
     is unusable.
     """
+    ensure_bird_box_column(conn)
     _import_lifelist(conn, LIFELIST_CSV)
     taxa = aves_taxa()
     name2taxon: dict[str, tuple[int, str, str]] = {}
@@ -1110,7 +1142,7 @@ def build_sightings(conn: sqlite3.Connection) -> dict[str, dict]:
     cands_cache: dict[str, list[dict]] = {}
     refs_cache: dict[str, list[EncRef]] = {}
     for d in conn.execute(
-            "SELECT folder, enc_id, best_frame, species, frames FROM decisions "
+            "SELECT folder, enc_id, best_frame, species, frames, bird_box FROM decisions "
             "WHERE action IN ('confirm','change')"):
         species = (d["species"] or "").strip()
         if not species:
@@ -1126,7 +1158,8 @@ def build_sightings(conn: sqlite3.Connection) -> dict[str, dict]:
             refs = refs_cache[folder] = _enc_refs(folder, cands, [])
         # task 25: resolve to the current encounter by frame overlap, not by
         # the exact stored key (a re-detection may have moved the best frame)
-        enc_ref, _status = resolve_decision(d["best_frame"], parse_frames(d["frames"]), refs)
+        enc_ref, _status = resolve_decision(d["best_frame"], parse_frames(d["frames"]),
+                                            refs, d["bird_box"])
         if enc_ref is None:
             continue
         enc = dict(next(c for c in cands if c["enc_id"] == enc_ref.enc_id))
@@ -1268,6 +1301,7 @@ def create_app(db_path: Path) -> Flask:
         g.db = sqlite3.connect(str(db_path))
         g.db.row_factory = sqlite3.Row
         ensure_frames_column(g.db)
+        ensure_bird_box_column(g.db)
         _import_lifelist(g.db, LIFELIST_CSV)
 
     @app.teardown_request
@@ -1399,7 +1433,7 @@ def create_app(db_path: Path) -> Flask:
         frames = list(c.get("frames", [])) if c else ([best_frame] if best_frame else [])
         _upsert_decision(g.db, folder, enc_id, best_frame, action, species,
                          (p.get("scientific") or "").strip(), (p.get("note") or "").strip(),
-                         frames)
+                         frames, _bird_box_of(c))
         return jsonify(ok=True)
 
     @app.route("/api/group", methods=["POST"])
@@ -1422,7 +1456,7 @@ def create_app(db_path: Path) -> Flask:
         for c in target:
             _upsert_decision(g.db, folder, c["enc_id"], c["best_frame"], action,
                              species if action == "confirm" else "", sci, "",
-                             c.get("frames", []))
+                             c.get("frames", []), _bird_box_of(c))
         return jsonify(ok=True, updated=len(target))
 
     @app.route("/api/cropboxes")

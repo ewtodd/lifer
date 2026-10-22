@@ -23,8 +23,11 @@ import torch
 from PIL import Image
 
 from .bioclip import BioCLIP, label_text
-from .boxes import get_box, open_db, removed_frames
-from .bursts import Encounter, FrameInfo, group_into_encounters
+from .birds import (MIN_LONG_SIDE, BirdDet, bird_boxes, bird_frames,
+                    average_probs, group_extra_birds, moved_frames, species_flags)
+from .boxes import Box, added_birds, get_box, open_db, removed_frames
+from .bursts import (Encounter, FrameInfo, best_frame_key,
+                     group_into_encounters)
 from .detect import (BirdDetector, Detection, FrameDetections, sharpness,
                      square_box, square_crop, usable_crop)
 from .extract import (Frame, jpeg_to_image, load_frame, load_frame_jpg,
@@ -35,28 +38,10 @@ from .lifelist import (LifeEntry, lifer_set, match_lifelist, parse_lifelist,
 from .outputs import Candidate, save_crop, save_frame_preview, write_candidates_csv, write_review_html
 from .region import (lifelist_place_counts, normalized, region_display_names,
                      species_counts)
-from .subject import CENTRE, read_af_points
+from .subject import CENTRE, iou, read_af_points
 from .taxonomy import aves_species
 
 LIFELIST = Path.home() / "BIRDING" / "LIFELIST.ods"
-
-# A lifelist species in the top 3 whose adjusted probability is at least this
-# fraction of the top-1's counts as "close behind": the encounter is then a
-# lookalike of a known bird, not a possible lifer. 0.1 sits in the natural
-# gap of the Dec 29 data between close second places (0.13-0.43, e.g. the
-# plover and scaup pairs) and distant ones (<0.11); see REPORT.md Task 02.
-LOOKALIKE_FRACTION = 0.1
-
-# "Rare here": the model is confident in a species (raw, T-calibrated top-1
-# above RARE_CONF) AND that species is uncommon at this place in the photo's
-# month window (share of the seasonal counts below RARE_SHARE, or absent).
-# RARE_CONF: at T=3.0 a top-1 of 0.60 means the model clearly leads one species
-# (not a coin-flip) -- it catches the weakest AMGP plover (0.651) with margin.
-# RARE_SHARE: 0.2% of the regional month-window observations. AMGP sits at
-# ~0.17% (below), its common look-alike Black-bellied Plover at ~0.89% (above),
-# so the prior's favorite stays unflagged while the true vagrant is lifted.
-RARE_CONF = 0.60
-RARE_SHARE = 0.002
 
 
 def resolve_region(trip_id: str) -> dict:
@@ -251,7 +236,6 @@ def classify_encounter(
             # blank/black frame or zero-area box: nothing to classify
             continue
         crops.append((f.name, crop))
-        rec._jpeg = None  # drop the decoded JPEG; keep only the crop
 
     if crops:
         probs = bioclip.probabilities([c for _, c in crops], txt, temperature)
@@ -273,6 +257,128 @@ def classify_encounter(
         return [0.0] * len(classes)
     n = len(vectors)
     return [sum(v.get(t, 0.0) for v in vectors) / n for t in order]
+
+
+def _write_bird_images(rec: FrameRecord, box, out_dir: Path, enc_id: str) -> None:
+    """The review page's images of one bird, cut from `rec`'s photo: the card
+    crop, the full frame with its box, and a box-less full frame for the crop
+    editor (same scale)."""
+    image = jpeg_to_image(rec._jpeg) if rec._jpeg else load_photo(rec.path)
+    save_crop(square_crop(image, box), out_dir / "crops" / f"{enc_id}.jpg")
+    save_frame_preview(image, box, out_dir / "frames" / f"{enc_id}.jpg")
+    save_frame_preview(image, None, out_dir / "frames" / "src" / f"{enc_id}.jpg")
+
+
+def _det_cache_path(cache_dir: Path, nef: Path) -> Path:
+    return cache_dir / "bioclip_dets" / f"{nef.stem}.json"
+
+
+def _box_key(box) -> str:
+    """Cache key of a detection box: rounded, because a re-detection can
+    shift a box by a fraction of a pixel without changing the bird."""
+    return ",".join(str(int(round(v))) for v in box)
+
+
+def classify_dets(frame_boxes: dict[str, list[tuple[tuple, float, bool]]],
+                  records: dict[str, FrameRecord], bioclip: BioCLIP,
+                  txt: torch.Tensor, order: list[int], cache_dir: Path,
+                  class_hash: str, temperature: float) -> list[dict]:
+    """BioCLIP on every given (box, conf, added) of each frame, one crop per
+    box. Per-detection results are cached beside the per-frame crop cache,
+    keyed by class set + temperature + the rounded box, so re-runs only read
+    the photo when a box is new. A crop that is blank is cached as such and
+    left out of the result."""
+    out: list[dict] = []
+    for name, items in frame_boxes.items():
+        rec = records[name]
+        cf = _det_cache_path(cache_dir, rec.path)
+        cached: dict[str, dict] = {}
+        if cf.exists():
+            try:
+                data = json.loads(cf.read_text())
+                if (data.get("class_hash") == class_hash
+                        and data.get("temp") == temperature):
+                    cached = data["dets"]
+            except (json.JSONDecodeError, KeyError, ValueError):
+                pass
+        todo = []
+        for box, conf, added in items:
+            hit = cached.get(_box_key(box))
+            if hit is None:
+                todo.append((box, conf, added))
+            elif hit["p"]:
+                out.append({"frame": name, "box": box, "conf": conf,
+                            "added": added, "sharp": hit["sharp"],
+                            "raw": {t: p for t, p in hit["p"]}})
+        if not todo:
+            continue
+        image = jpeg_to_image(rec._jpeg) if rec._jpeg else load_photo(rec.path)
+        crops = []
+        for box, conf, added in todo:
+            crop = square_crop(image, Box(*box))
+            if usable_crop(crop):
+                crops.append((box, conf, added, crop))
+            else:
+                cached[_box_key(box)] = {"p": [], "sharp": 0.0}
+        if crops:
+            probs = bioclip.probabilities([c[3] for c in crops], txt, temperature)
+            for (box, conf, added, crop), row in zip(crops, probs):
+                sharp = round(sharpness(crop), 1)
+                vec = {t: float(p) for t, p in zip(order, row)}
+                # drop the tail: ~1000 near-zero entries per box add nothing
+                cached[_box_key(box)] = {
+                    "p": [[t, round(p, 6)] for t, p in vec.items() if p >= 1e-5],
+                    "sharp": sharp}
+                out.append({"frame": name, "box": box, "conf": conf,
+                            "added": added, "sharp": sharp, "raw": vec})
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        cf.write_text(json.dumps({"class_hash": class_hash, "temp": temperature,
+                                  "dets": cached}))
+    return out
+
+
+def burst_birds(enc: Encounter, records: dict[str, FrameRecord], folder: str,
+                added: list[tuple[str, list[float]]], conn, bioclip: BioCLIP,
+                txt: torch.Tensor, order: list[int], season: dict,
+                alpha: float, cache_dir: Path, class_hash: str,
+                temperature: float, primary_adj: dict[int, float]):
+    """The extra birds of a burst (see birds.py): every sizeable detection
+    plus the owner's added boxes is classified on its own, and the ones that
+    are clearly another species than the primary become birds."""
+    frame_order = [f.name for f in enc.frames]
+    wanted: dict[str, list[tuple[tuple, float, bool]]] = {}
+    subject_box: dict[str, Box | None] = {}
+    for name in frame_order:
+        rec = records[name]
+        # the primary's box in this frame (override, else the AF-point subject)
+        subject_box[name] = get_box(folder, name, conn, dets=rec.dets.dets,
+                                    af=rec.dets.af,
+                                    size=(rec.dets.width, rec.dets.height))
+        mine = [(tuple(b), 1.0, True) for fr, b in added if fr == name]
+        for d in rec.dets.dets:
+            box = (d.x1, d.y1, d.x2, d.y2)
+            if max(d.x2 - d.x1, d.y2 - d.y1) < MIN_LONG_SIDE:
+                continue
+            # an owner-drawn box stands in for the detector box it overlaps
+            if any(iou(box, m[0]) >= 0.5 for m in mine):
+                continue
+            wanted.setdefault(name, []).append((box, d.conf, False))
+        if mine:
+            wanted.setdefault(name, []).extend(mine)
+    found = classify_dets(wanted, records, bioclip, txt, order, cache_dir,
+                          class_hash, temperature)
+    dets = []
+    for r in found:
+        sb = subject_box[r["frame"]]
+        adj = {t: r["raw"].get(t, 0.0) * season.get(t, 0.0) ** alpha for t in order}
+        total = sum(adj.values()) or 1.0
+        dets.append(BirdDet(
+            frame=r["frame"], box=tuple(r["box"]), conf=r["conf"], sharp=r["sharp"],
+            raw=r["raw"], adj={t: v / total for t, v in adj.items()},
+            subject=(not r["added"] and sb is not None
+                     and iou(r["box"], (sb.x1, sb.y1, sb.x2, sb.y2)) >= 0.5),
+            added=r["added"]))
+    return group_extra_birds(dets, primary_adj, frame_order)
 
 
 def run_folder(folder_arg: str | Path, root: str | Path | None = None,
@@ -401,6 +507,12 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
         inat_cache.mkdir(parents=True, exist_ok=True)
         torch.save(txt.cpu(), label_cache)
         print(f"  labels encoded [{time.time() - t0:.0f}s]", flush=True)
+    # the owner's hand-drawn birds; each becomes an extra bird of its burst
+    added = added_birds(db_conn, name)
+    n_extra = 0
+    for sub in ("crops", "frames", "frames/src"):  # extra birds are rebuilt below
+        for stale in (out_dir / sub).glob("enc_*-*.jpg"):
+            stale.unlink()
     cands: list[Candidate] = []
     nodet_encs: list[dict[str, object]] = []  # encounters with no usable detection
     nodet_frames: set[str] = set()  # their frames, for the thumbnail pass below
@@ -440,75 +552,66 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
         p_adj = {t: p_clip[t] * season.get(t, 0.0) ** alpha for t in order}
         adj_total = sum(p_adj.values()) or 1.0
         p_adj = {t: v / adj_total for t, v in p_adj.items()}
-
-        def top3(dist: dict[int, float]) -> list[tuple[str, str, float]]:
-            top = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)[:3]
-            return [(classes[t].common, classes[t].scientific, p) for t, p in top]
-
-        adj_sorted = sorted(p_adj.items(), key=lambda kv: kv[1], reverse=True)
-        adj_top1, adj_top1_p = adj_sorted[0]
         # has_det is True here: no-detection encounters `continue`d above
+        flags = species_flags(p_clip, p_adj, classes, lifers, seasonal_counts,
+                              alltime_counts, region_name, window_label)
 
-        # "Rare here": a confident raw top-1 on a species that is uncommon at
-        # this place in the photo's month window. Computed on the RAW
-        # (T-calibrated, prior-free) probabilities so the regional prior can't
-        # mask a true vagrant; beats lifer_lookalike (see run_folder docstring).
-        raw_top1_tid, raw_top1_p = max(p_clip.items(), key=lambda kv: kv[1])
-        rare_here = (
-            raw_top1_p >= RARE_CONF
-            and (seasonal_counts.get(raw_top1_tid, 0.0) / seasonal_total) < RARE_SHARE
-        )
-        # evidence behind the rare flag: the species' share of the place's
-        # month-window records and of its all-time records
-        rare_evidence = ""
-        if rare_here:
-            s_share = seasonal_counts.get(raw_top1_tid, 0.0) / seasonal_total
-            a_share = alltime_counts.get(raw_top1_tid, 0.0) / alltime_total
-            rare_evidence = (
-                f"{s_share * 100:.2f}% of {window_label} iNaturalist records "
-                f"in {region_name} (all-time {a_share * 100:.1f}%)"
-            )
-
-        possible_lifer = False
-        lookalike = None
-        if adj_top1 not in lifers:
-            # Closest lifelist species in the top 3; if it's within
-            # LOOKALIKE_FRACTION of the top-1's probability, flag it as a
-            # lookalike of a known bird instead of a possible lifer.
-            close = max(((t, p) for t, p in adj_sorted[:3] if t in lifers),
-                        key=lambda tp: tp[1], default=None)
-            if close is not None and close[1] >= LOOKALIKE_FRACTION * adj_top1_p:
-                lookalike = classes[close[0]].common
-            else:
-                possible_lifer = True
+        # Other species in the same burst become birds of their own. A frame
+        # whose subject (the bird at the AF point) is one of them leaves the
+        # primary's frames: the photographer re-aimed mid-burst.
+        extras = burst_birds(enc, records, name, added, db_conn, bioclip, txt,
+                             order, season, alpha, cache_dir, class_hash,
+                             temperature, p_adj)
+        gone = moved_frames(extras)
+        kept = [f for f in enc.frames if f.name not in gone] or [best]
+        if best.name not in {f.name for f in kept}:
+            best = max(kept, key=lambda f: best_frame_key(f.name, f.sharpness))
+            rec = records[best.name]
         cands.append(Candidate(
             enc_id=enc_id,
-            time_start=enc.start.strftime("%Y-%m-%d %H:%M:%S"),
-            time_end=enc.end.strftime("%Y-%m-%d %H:%M:%S"),
-            n_frames=len(enc.frames),
+            time_start=kept[0].timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            time_end=kept[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            n_frames=len(kept),
             best_frame=best.name,
             det_conf=best.best_conf,
-            raw_top3=top3(p_clip),
-            adj_top3=top3(p_adj),
-            possible_lifer=possible_lifer,
-            lifer_lookalike=lookalike,
             has_det=True,
-            rare_here=rare_here,
-            rare_evidence=rare_evidence,
-            frames=[f.name for f in enc.frames],
+            frames=[f.name for f in kept],
+            **flags,
         ))
         # best crop for the review page (no-detection encounters never get
         # here; they are listed in the "No bird detected" section instead)
         crop_box = get_box(name, best.name, db_conn, dets=rec.dets.dets,
                            af=rec.dets.af, size=(rec.dets.width, rec.dets.height))
         if crop_box is not None:
-            image = jpeg_to_image(rec._jpeg) if rec._jpeg else load_photo(rec.path)
-            save_crop(square_crop(image, crop_box), out_dir / "crops" / f"{enc_id}.jpg")
-            # full-frame preview with the detection box, for the lightbox
-            save_frame_preview(image, crop_box, out_dir / "frames" / f"{enc_id}.jpg")
-            # box-less full-frame preview for the crop editor (same scale)
-            save_frame_preview(image, None, out_dir / "frames" / "src" / f"{enc_id}.jpg")
-            rec._jpeg = None
+            _write_bird_images(rec, crop_box, out_dir, enc_id)
+
+        frame_order = [f.name for f in enc.frames]
+        for n, bird in enumerate(extras, 1):
+            bird_id = f"{enc_id}-{n}"
+            b_flags = species_flags(
+                average_probs(bird, "raw"), average_probs(bird, "adj"), classes,
+                lifers, seasonal_counts, alltime_counts, region_name, window_label)
+            b_frames = bird_frames(bird, frame_order)
+            stamps = [records[f].timestamp for f in b_frames]
+            cands.append(Candidate(
+                enc_id=bird_id,
+                time_start=min(stamps).strftime("%Y-%m-%d %H:%M:%S"),
+                time_end=max(stamps).strftime("%Y-%m-%d %H:%M:%S"),
+                n_frames=len(b_frames),
+                best_frame=bird.best.frame,
+                det_conf=max(d.conf for d in bird.dets),
+                has_det=True,
+                frames=b_frames,
+                bird=n,
+                boxes=bird_boxes(bird),
+                **b_flags,
+            ))
+            _write_bird_images(records[bird.best.frame], Box(*bird.best.box),
+                               out_dir, bird_id)
+            n_extra += 1
+        for f in enc.frames:
+            if records[f.name].dets.dets:
+                records[f.name]._jpeg = None  # the burst is done with its photos
         if i % 10 == 0 or i == len(encounters):
             print(f"  classified {i}/{len(encounters)} encounters "
                   f"[{time.time() - t0:.0f}s]", flush=True)
@@ -572,7 +675,8 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
 
     n_lifers = sum(1 for c in cands if c.possible_lifer)
     n_lookalikes = sum(1 for c in cands if c.lifer_lookalike)
-    print(f"\n{name}: {len(photos)} frames, {len(encounters)} encounters, "
+    print(f"\n{name}: {len(photos)} frames, {len(encounters)} encounters "
+          f"(+{n_extra} extra birds), "
           f"{n_lifers} possible lifers, {n_lookalikes} lifer lookalikes, "
           f"{len(nodet_encs)} encounters + {len(no_det) - len(nodet_encs)} "
           f"frames w/o birds")

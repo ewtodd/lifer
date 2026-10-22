@@ -190,7 +190,8 @@ def confirmed_encounters(conn: sqlite3.Connection, folder: str) -> list[EncRef]:
             continue
         if not (d.get("species") or "").strip():
             continue
-        enc, _status = resolve_decision(d["best_frame"], parse_frames(d["frames"]), refs)
+        enc, _status = resolve_decision(d["best_frame"], parse_frames(d["frames"]),
+                                       refs, d.get("bird_box", ""))
         if enc is not None:
             seen.setdefault(enc.enc_id, enc)
     return list(seen.values())

@@ -64,8 +64,45 @@ def open_db(db_path: Path | None = None) -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS removed_frames ("
         " folder TEXT NOT NULL, frame TEXT NOT NULL, updated_at TEXT NOT NULL, "
         " PRIMARY KEY (folder, frame))")
+    # Birds the owner added by drawing a box the detector missed; the pipeline
+    # injects each as a detection that always becomes its own extra bird.
+    conn.execute(ADDED_BIRDS_DDL)
     conn.commit()
     return conn
+
+
+ADDED_BIRDS_DDL = (
+    "CREATE TABLE IF NOT EXISTS added_birds ("
+    " folder TEXT NOT NULL, frame TEXT NOT NULL, x1 REAL NOT NULL, "
+    " y1 REAL NOT NULL, x2 REAL NOT NULL, y2 REAL NOT NULL, "
+    " updated_at TEXT NOT NULL, "
+    " PRIMARY KEY (folder, frame, x1, y1, x2, y2))")
+
+
+def add_bird(conn: sqlite3.Connection, folder: str, frame: str,
+             box: list[float]) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT OR REPLACE INTO added_birds (folder, frame, x1, y1, x2, y2, "
+        "updated_at) VALUES (?,?,?,?,?,?,?)",
+        (folder, frame, *[float(v) for v in box[:4]], now))
+    conn.commit()
+
+
+def remove_added_bird(conn: sqlite3.Connection, folder: str, frame: str,
+                      box: list[float]) -> None:
+    conn.execute(
+        "DELETE FROM added_birds WHERE folder=? AND frame=? AND x1=? AND y1=? "
+        "AND x2=? AND y2=?", (folder, frame, *[float(v) for v in box[:4]]))
+    conn.commit()
+
+
+def added_birds(conn: sqlite3.Connection, folder: str) -> list[tuple[str, list[float]]]:
+    """The folder's owner-added birds as (frame, [x1, y1, x2, y2])."""
+    return [(r["frame"], [r["x1"], r["y1"], r["x2"], r["y2"]])
+            for r in conn.execute(
+                "SELECT frame, x1, y1, x2, y2 FROM added_birds WHERE folder=? "
+                "ORDER BY frame, x1, y1", (folder,))]
 
 
 def to_list(box: Box) -> list[float]:

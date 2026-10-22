@@ -23,7 +23,7 @@ from torchvision.io import ImageReadMode, decode_jpeg
 from ultralytics import YOLO
 
 from .home import weights_dir
-from .subject import box_distance, subject_det
+from .subject import box_distance, iou, subject_det
 
 BIRD_CLASS = 14  # COCO class id for "bird"
 
@@ -67,15 +67,6 @@ def _weights_fingerprint(path: Path) -> str:
                 break
             h.update(chunk)
     return f"{path.name}:{path.stat().st_size}:{h.hexdigest()[:16]}"
-
-
-def iou(a, b) -> float:
-    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
-    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
-    inter = ix * iy
-    union = ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1])
-             - inter)
-    return inter / union if union > 0 else 0.0
 
 
 def _xyxy(d: Detection) -> tuple[float, float, float, float]:

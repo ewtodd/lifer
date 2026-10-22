@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .bursts import FrameInfo, group_into_encounters
-from .decisions import ensure_frames_column
+from .decisions import ensure_bird_box_column, ensure_frames_column
 from .home import trip_id_for
 
 if TYPE_CHECKING:
@@ -358,6 +358,7 @@ def apply_migrate_trips(home: Path, conn: sqlite3.Connection | None,
     if conn is None:
         return plan
     conn.row_factory = sqlite3.Row
+    ensure_bird_box_column(conn)  # the rekey copies decisions.bird_box
 
     # Case A: rekey raw-bucket trips into their parent.
     for entry in plan["rekey"]:
@@ -370,10 +371,10 @@ def apply_migrate_trips(home: Path, conn: sqlite3.Connection | None,
                 continue
             conn.execute(
                 "INSERT INTO decisions (folder, enc_id, best_frame, action,"
-                " species, scientific, note, frames, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
+                " species, scientific, note, frames, updated_at, bird_box)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (new, d["enc_id"], d["best_frame"], d["action"], d["species"],
-                 d["scientific"], d["note"], d["frames"], d["updated_at"]))
+                 d["scientific"], d["note"], d["frames"], d["updated_at"], d["bird_box"]))
             conn.execute(
                 "DELETE FROM decisions WHERE folder=? AND enc_id=? "
                 "AND best_frame=?", (old, d["enc_id"], d["best_frame"]))

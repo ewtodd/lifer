@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import cast
 
 from .bursts import FrameInfo, group_into_encounters
+from .subject import iou
 
 
 @dataclass
@@ -33,6 +34,47 @@ class EncRef:
     enc_id: str
     best_frame: str
     frames: list[str] = field(default_factory=list)
+    # Several species in one burst: bird 0 is the burst's primary bird (enc_id
+    # as before); extra birds are enc_XXXX-N and carry their own box per frame.
+    bird: int = 0
+    boxes: dict[str, list[float]] = field(default_factory=dict)
+
+
+# a decision on an extra bird resolves to the ref whose box in the decision's
+# frame overlaps the stored box at least this much
+BIRD_BOX_IOU = 0.3
+
+
+def parse_boxes(s: str | None) -> dict[str, list[float]]:
+    """Parse candidates.csv's `boxes` column ({frame: [x1, y1, x2, y2]})."""
+    if not s:
+        return {}
+    try:
+        v = json.loads(s)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(v, dict):
+        return {}
+    return {str(k): [float(x) for x in b[:4]] for k, b in v.items()
+            if isinstance(b, (list, tuple)) and len(b) >= 4}
+
+
+def parse_bird_box(s: str | None) -> tuple[str, list[float]] | None:
+    """Parse decisions.bird_box ('[frame, x1, y1, x2, y2]'); None for '' (a
+    decision about a burst's primary bird) or anything malformed."""
+    if not s:
+        return None
+    try:
+        v = json.loads(s)
+        if isinstance(v, list) and len(v) == 5:
+            return str(v[0]), [float(x) for x in v[1:]]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None
+
+
+def bird_box_json(frame: str, box: list[float]) -> str:
+    return json.dumps([frame, *[round(float(x), 1) for x in box[:4]]])
 
 
 def parse_frames(s: str | None) -> list[str]:
@@ -60,15 +102,41 @@ def ensure_frames_column(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def ensure_bird_box_column(conn: sqlite3.Connection) -> None:
+    """DBs predating extra birds lack decisions.bird_box; add it in place."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(decisions)")]
+    if cols and "bird_box" not in cols:
+        conn.execute("ALTER TABLE decisions ADD COLUMN bird_box TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+
+
 def resolve_decision(best_frame: str, frames: list[str],
-                     encs: list[EncRef]) -> tuple[EncRef | None, str]:
+                     encs: list[EncRef],
+                     bird_box: str = "") -> tuple[EncRef | None, str]:
     """Resolve a decision to one of `encs` by frame overlap.
 
     Returns (enc, status) where status is 'best-frame' (the unique
     encounter containing the decision's best frame), 'overlap' (a unique
     most-shared-frames winner), 'ambiguous' (a tie, or the best frame in
-    two encounters), or 'none' (no overlap at all).
+    two encounters), 'bird-box' (an extra bird, see below), or 'none'
+    (no overlap at all).
+
+    A decision without a `bird_box` (every pre-extra-birds one) is about a
+    burst's primary bird and only sees primary refs. One with a `bird_box`
+    is about an extra bird: it resolves to the extra ref whose box in that
+    frame overlaps the stored one most (IoU >= BIRD_BOX_IOU), else to none --
+    extra birds renumber between runs, the box is what identifies them.
     """
+    bb = parse_bird_box(bird_box)
+    if bb is not None:
+        frame, box = bb
+        scored = [(iou(box, e.boxes[frame]), e) for e in encs
+                  if e.bird > 0 and frame in e.boxes]
+        scored = [(v, e) for v, e in scored if v >= BIRD_BOX_IOU]
+        if not scored:
+            return None, "none"
+        return max(scored, key=lambda t: t[0])[1], "bird-box"
+    encs = [e for e in encs if e.bird == 0]
     if best_frame:
         hits = [e for e in encs if best_frame in e.frames]
         if len(hits) == 1:
@@ -78,7 +146,7 @@ def resolve_decision(best_frame: str, frames: list[str],
     if frames:
         fset = set(frames)
         scored = [(len(fset & set(e.frames)), e) for e in encs]
-        top = max(n for n, _e in scored)
+        top = max((n for n, _e in scored), default=0)
         if top > 0:
             ties = [e for n, e in scored if n == top]
             if len(ties) == 1:
@@ -139,7 +207,10 @@ def encounters_from_outputs(home: Path, folder: str) -> list[EncRef]:
         with open(c, newline="") as f:
             for row in csv.DictReader(f):
                 frames = [x for x in (row.get("frames") or "").split(",") if x]
-                encs.append(EncRef(row["enc_id"], row["best_frame"], frames))
+                encs.append(EncRef(
+                    row["enc_id"], row["best_frame"], frames,
+                    bird=int(row.get("bird") or 0),
+                    boxes=parse_boxes(row.get("boxes"))))
     n = run / "nodet.json"
     if n.is_file():
         try:
@@ -185,6 +256,7 @@ def plan_migrate_decisions(home: Path, conn: sqlite3.Connection) -> dict[str, ob
     home = Path(home)
     conn.row_factory = sqlite3.Row
     ensure_frames_column(conn)
+    ensure_bird_box_column(conn)
 
     entries: list[dict[str, object]] = []
     ambiguous: list[dict[str, object]] = []
@@ -193,12 +265,13 @@ def plan_migrate_decisions(home: Path, conn: sqlite3.Connection) -> dict[str, ob
     for (folder,) in conn.execute("SELECT DISTINCT folder FROM decisions ORDER BY folder"):
         encs = current_encounters(home, folder)
         for d in conn.execute(
-                "SELECT folder, enc_id, best_frame, action, species, frames "
+                "SELECT folder, enc_id, best_frame, action, species, frames, bird_box "
                 "FROM decisions WHERE folder=? ORDER BY enc_id, best_frame",
                 (folder,)):
             n_decisions += 1
             frames = parse_frames(d["frames"])
-            enc, status = resolve_decision(d["best_frame"], frames, encs)
+            enc, status = resolve_decision(d["best_frame"], frames, encs,
+                                          d["bird_box"])
             if enc is None:
                 reason = ("no run outputs or cache for this trip"
                           if not encs else

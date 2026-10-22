@@ -22,15 +22,13 @@ from pathlib import Path
 import torch
 
 from .bioclip import BioCLIP
+from .birds import species_flags
 from .home import lifer_home, find_regions_toml
 
 # Must match the pipeline's run_folder defaults/knobs (the values the
 # candidate's top 3 were produced with).
 TEMP = 3.0
 ALPHA = 0.3
-RARE_CONF = 0.60
-RARE_SHARE = 0.002
-LOOKALIKE_FRACTION = 0.1
 IDLE_SECONDS = 600
 LIFELIST = Path.home() / "BIRDING" / "LIFELIST.ods"
 
@@ -132,8 +130,6 @@ def identify_crop(folder: str, frame: str, crop) -> dict:
     classes, alltime_counts, seasonal_counts = species_counts(
         place_id, month, inat_cache)
     season = normalized(seasonal_counts)
-    seasonal_total = sum(seasonal_counts.values()) or 1.0
-    alltime_total = sum(alltime_counts.values()) or 1.0
     rn, _rs = region_display_names(region, inat_cache)
     region_name = rn or folder
     m = month.month
@@ -165,44 +161,13 @@ def identify_crop(folder: str, frame: str, crop) -> dict:
     adj_total = sum(p_adj_raw.values()) or 1.0
     p_adj = {t: v / adj_total for t, v in p_adj_raw.items()}
 
-    def top3(dist):
-        top = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)[:3]
-        return [(classes[t].common, classes[t].scientific, p) for t, p in top]
-
-    adj_sorted = sorted(p_adj.items(), key=lambda kv: kv[1], reverse=True)
-    adj_top1, adj_top1_p = adj_sorted[0]
-    raw_top1_tid, raw_top1_p = max(p_clip.items(), key=lambda kv: kv[1])
-
-    rare_here = (raw_top1_p >= RARE_CONF
-                 and (seasonal_counts.get(raw_top1_tid, 0.0) / seasonal_total)
-                 < RARE_SHARE)
-    rare_evidence = ""
-    if rare_here:
-        s_share = seasonal_counts.get(raw_top1_tid, 0.0) / seasonal_total
-        a_share = alltime_counts.get(raw_top1_tid, 0.0) / alltime_total
-        rare_evidence = (
-            f"{s_share * 100:.2f}% of {window_label} iNaturalist records "
-            f"in {region_name} (all-time {a_share * 100:.1f}%)")
-
-    possible_lifer = False
-    lookalike = ""
-    if adj_top1 not in lifers:
-        close = max(((t, p) for t, p in adj_sorted[:3] if t in lifers),
-                    key=lambda tp: tp[1], default=None)
-        if close is not None and close[1] >= LOOKALIKE_FRACTION * adj_top1_p:
-            lookalike = classes[close[0]].common
-        else:
-            possible_lifer = True
-
-    raw_top = top3(p_clip)
-    adj_top = top3(p_adj)
+    flags = species_flags(p_clip, p_adj, classes, lifers, seasonal_counts,
+                          alltime_counts, region_name, window_label)
+    adj_top = flags["adj_top3"]
     return {
-        "raw_top3": raw_top,
-        "adj_top3": adj_top,
-        "possible_lifer": possible_lifer,
-        "lifer_lookalike": lookalike,
-        "rare_here": rare_here,
-        "rare_evidence": rare_evidence,
+        **flags,
+        # the review app stores "no lookalike" as an empty string
+        "lifer_lookalike": flags["lifer_lookalike"] or "",
         "elapsed": elapsed,
         "top1": adj_top[0][0] if adj_top else "",
     }
