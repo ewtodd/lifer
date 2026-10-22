@@ -102,11 +102,15 @@ def parse_lifelist(path: Path) -> list[list[str]]:
     return data
 
 
-def match_lifelist(entries: list[list[str]], taxa: list[Taxon], cutoff: int = 80) -> list[LifeEntry]:
+def match_lifelist(entries: list[list[str]], taxa: list[Taxon],
+                   cutoff: int = 80, region_ids: set[int] | None = None) -> list[LifeEntry]:
     """Fuzzy-match each typed species name to an Aves taxon by common name.
 
     Scientific names in the lifelist also match: we key the candidate table on
-    both common and scientific names so either input form resolves.
+    both common and scientific names so either input form resolves. When
+    ``region_ids`` is given (the taxa observed in the region being run), a
+    near-tie is resolved toward the taxon that actually occurs there, which
+    handles recent taxonomic splits (e.g. European vs American Herring Gull).
     """
     # candidate table: name -> taxon. Common names are the primary key;
     # scientific names included as secondary candidates.
@@ -116,19 +120,33 @@ def match_lifelist(entries: list[list[str]], taxa: list[Taxon], cutoff: int = 80
             candidates[t.common.lower()] = t
         candidates[t.scientific.lower()] = t
     keys = list(candidates.keys())
+    region = set(region_ids) if region_ids else None
 
     out: list[LifeEntry] = []
     for typed, date, location, _details in entries:
         if not typed:
             continue
-        # WRatio is case-sensitive; keys are lowercase, so lowercase the query
-        best = process.extractOne(typed.lower(), keys, scorer=fuzz.WRatio, score_cutoff=cutoff)
-        if best is None:
-            out.append(LifeEntry(typed=typed, date=date, location=location, taxon=None, score=0.0))
-        else:
-            name, score, _ = best
+        # WRatio is case-sensitive; keys are lowercase, so lowercase the query.
+        # Keep the top handful so a region-appropriate taxon can win a near-tie.
+        top = process.extract(typed.lower(), keys, scorer=fuzz.WRatio,
+                              score_cutoff=cutoff, limit=8)
+        if not top:
             out.append(LifeEntry(typed=typed, date=date, location=location,
-                                 taxon=candidates[name], score=score))
+                                 taxon=None, score=0.0))
+            continue
+        best_name, best_score, _ = top[0]
+        chosen = candidates[best_name]
+        chosen_score = best_score
+        if region:
+            # Prefer a taxon that occurs here if it scores within a small
+            # tolerance of the outright best (a split pair is nearly tied).
+            for name, score, _ in top:
+                if score >= best_score - 3 and candidates[name].id in region:
+                    chosen = candidates[name]
+                    chosen_score = score
+                    break
+        out.append(LifeEntry(typed=typed, date=date, location=location,
+                             taxon=chosen, score=chosen_score))
     return out
 
 

@@ -245,7 +245,10 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
     t0 = time.time()
     taxa = aves_species(inat_cache)
     entries = parse_lifelist(LIFELIST)
-    matched = match_lifelist(entries, taxa)
+    # the region's observed species lets a near-tied fuzzy match resolve toward
+    # the taxon that actually occurs here (e.g. American not European Herring Gull)
+    region_classes, _, _ = species_counts(place_id, None, inat_cache)
+    matched = match_lifelist(entries, taxa, region_ids=set(region_classes.keys()))
     write_lifelist_csv(matched, home / "data" / "lifelist.csv")
     lifers = lifer_set(matched)
     n_unmatched = sum(1 for e in matched if e.taxon is None)
