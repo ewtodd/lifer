@@ -17,6 +17,8 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
+import shutil
 import sqlite3
 import tomllib
 from datetime import date, datetime, timedelta
@@ -29,19 +31,21 @@ from PIL import Image
 from rapidfuzz import fuzz, process
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from .boxes import (Box, add_removed_frame, clear_frame_choice, clear_override,
+from .boxes import (Box, add_bird, add_removed_frame, added_birds,
+                    clear_frame_choice, clear_override,
                     get_box, get_frame_choice, get_override, get_reid,
                     get_snapshot, representative_frame, set_frame_choice,
-                    set_override, to_list)
+                    remove_added_bird, set_override, to_list)
 from .bursts import best_frame_key
 from .decisions import (EncRef, bird_box_json, current_encounters,
                         ensure_bird_box_column, ensure_frames_column,
-                        parse_boxes, parse_frames, resolve_decision)
+                        matches_bird_box, parse_boxes, parse_frames,
+                        resolve_decision)
 from .extract import load_photo
 from .home import lifer_home, find_regions_toml, source_folder_for_trip
 from .outputs import CSS, save_crop, save_frame_preview
 from .region import region_display_names
-from .subject import subject_from_cache
+from .subject import iou, subject_from_cache
 
 # state dir without importing .pipeline (that pulls in torch; serving needs no GPU)
 RUNS = lifer_home() / "runs"
@@ -118,6 +122,13 @@ CREATE TABLE IF NOT EXISTS added_birds (
   y2 REAL NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (folder, frame, x1, y1, x2, y2)
+);
+CREATE TABLE IF NOT EXISTS gallery_subject (
+  folder TEXT NOT NULL,
+  frame TEXT NOT NULL,      -- a frame holding several confirmed birds
+  bird_box TEXT NOT NULL DEFAULT '', -- which one the gallery names: as decisions.bird_box, '' = the primary
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (folder, frame)
 );
 """
 
@@ -244,12 +255,33 @@ def _candidate_fieldnames(folder: str) -> list[str]:
             "lifer_lookalike", "rare_here", "rare_evidence"]
 
 
+def _ensure_bird_columns(folder: str) -> None:
+    """Runs from before extra birds lack the `bird` / `boxes` columns; a new
+    extra-bird row written without them would read back as a primary."""
+    path = RUNS / folder / "candidates.csv"
+    if not path.is_file():
+        return
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        names = list(reader.fieldnames or [])
+        rows = list(reader)
+    if not names or ("bird" in names and "boxes" in names):
+        return
+    names += [n for n in ("bird", "boxes") if n not in names]
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=names)
+        w.writeheader()
+        w.writerows(rows)
+
+
 def _insert_candidate_row(folder: str, enc_id: str, base: dict,
                           fields: dict) -> None:
     """Append a candidate row for a no-detection encounter that got a manual
     crop fix: it had no row in candidates.csv before (task 23)."""
     path = RUNS / folder / "candidates.csv"
+    _ensure_bird_columns(folder)
     fieldnames = _candidate_fieldnames(folder)
+    boxes = base.get("boxes") or {}
     row = {
         "enc_id": enc_id,
         "time_start": base.get("time_start", ""),
@@ -258,6 +290,8 @@ def _insert_candidate_row(folder: str, enc_id: str, base: dict,
         "best_frame": base.get("best_frame", ""),
         "frames": ",".join([str(x) for x in (base.get("frames") or [])]
                            or ([base["best_frame"]] if base.get("best_frame") else [])),
+        "bird": int(base.get("bird", 0)),
+        "boxes": json.dumps(boxes, separators=(",", ":")) if boxes else "",
         "det_conf": f"{float(base.get('det_conf', 0.0)):.3f}",
         "raw_top3": _fmt_top3(fields["raw_top3"]),
         "adj_top3": _fmt_top3(fields["adj_top3"]),
@@ -537,29 +571,47 @@ def _group_section(encs: list[dict]) -> str:
 
 
 def _frame_views(folder: str, frames: list[str], best_frame: str,
-                 repr_frame: str, conn: sqlite3.Connection | None) -> list[dict]:
+                 repr_frame: str, conn: sqlite3.Connection | None,
+                 bird_id: str = "", boxes: dict | None = None,
+                 gallery_frames: frozenset | set = frozenset()) -> list[dict]:
     """Per-frame views for an encounter's frame strip + lightbox (task 12).
 
     Best (sharpest) frame first; each frame carries its crop / full-frame
     preview / box-less source URLs, and whether a usable detection box exists
     (frames without one still appear, tagged `has_box` False for a "no box"
-    label and an available fix-crop)."""
+    label and an available fix-crop).
+
+    An extra bird (`bird_id`, `boxes`) has its own box per frame, so its crop
+    and box preview are the on-demand per-bird assets, not the primary's
+    subject/override box. `gallery_frames` are the frames the owner chose this
+    bird as the gallery subject of."""
     out: list[dict] = []
     for f in frames:
         cache = _frame_cache(folder, f) or {}
-        dets = cache.get("dets") or []
-        override = get_override(conn, folder, f) if conn is not None else None
-        has_box = bool(dets) or override is not None
         sharp = float(cache.get("sharpness", -1.0))
+        if bird_id:
+            override = None
+            has_box = f in (boxes or {})
+            crop = (f"/media/{folder}/crops/birds/{bird_id}/{f}.jpg" if has_box
+                    else f"/media/{folder}/frames/frames/{f}.jpg")
+            frame = (f"/media/{folder}/frames/birds/{bird_id}/{f}.jpg" if has_box
+                     else f"/media/{folder}/frames/src/frames/{f}.jpg")
+        else:
+            dets = cache.get("dets") or []
+            override = get_override(conn, folder, f) if conn is not None else None
+            has_box = bool(dets) or override is not None
+            crop = (f"/media/{folder}/crops/frames/{f}.jpg" if has_box
+                    else f"/media/{folder}/frames/frames/{f}.jpg")
+            frame = f"/media/{folder}/frames/frames/{f}.jpg"
         out.append({
             "name": f,
             "sharp": round(sharp, 1) if sharp > 0 else 0,
             "has_box": has_box,
             "best": f == best_frame,
             "chosen": f == repr_frame,
-            "crop": (f"/media/{folder}/crops/frames/{f}.jpg" if has_box
-                     else f"/media/{folder}/frames/frames/{f}.jpg"),
-            "frame": f"/media/{folder}/frames/frames/{f}.jpg",
+            "gallery": f in gallery_frames,
+            "crop": crop,
+            "frame": frame,
             "src": f"/media/{folder}/frames/src/frames/{f}.jpg",
             "override": to_list(override) if override else None,
         })
@@ -569,8 +621,15 @@ def _frame_views(folder: str, frames: list[str], best_frame: str,
 
 def _enc_view(folder: str, c: dict, decision: dict | None,
               conn: sqlite3.Connection | None = None,
-              frames: list[str] | None = None) -> dict:
+              frames: list[str] | None = None,
+              mates: list[dict] | None = None,
+              gallery: dict[str, str] | None = None,
+              added: list[tuple[str, list[float]]] | None = None) -> dict:
+    """One bird's card. `mates` are the other birds of its burst, `gallery`
+    maps frame -> gallery_subject.bird_box, `added` the owner-drawn boxes."""
     top1 = c["adj_top3"][0]
+    bird = c.get("bird", 0)
+    boxes = c.get("boxes") or {}
     # The encounter's frames (task 12): candidates.csv carries them on new
     # runs; old runs get them rebuilt by _enc_refs, and we always fall back to
     # the pipeline-best frame so there is at least one.
@@ -579,13 +638,27 @@ def _enc_view(folder: str, c: dict, decision: dict | None,
         frames = [c["best_frame"]]
     repr_frame = (representative_frame(conn, folder, frames, c["best_frame"])
                   if conn is not None else c["best_frame"])
-    fviews = _frame_views(folder, frames, c["best_frame"], repr_frame, conn)
+    ref = EncRef(c["enc_id"], c["best_frame"], frames, bird=bird, boxes=boxes)
+    gallery_frames = {f for f in frames
+                      if f in (gallery or {}) and matches_bird_box(ref, gallery[f])}
+    fviews = _frame_views(folder, frames, c["best_frame"], repr_frame, conn,
+                          bird_id=c["enc_id"] if bird else "", boxes=boxes,
+                          gallery_frames=gallery_frames)
     repr_i = next((i for i, fv in enumerate(fviews) if fv["name"] == repr_frame), 0)
-    override = get_override(conn, folder, repr_frame) if conn is not None else None
-    reid = get_reid(conn, folder, repr_frame) if conn is not None else None
+    # crop fixes belong to the primary's subject box; extra birds have none yet
+    override = (get_override(conn, folder, repr_frame)
+                if conn is not None and not bird else None)
+    reid = (get_reid(conn, folder, repr_frame)
+            if conn is not None and not bird else None)
     chosen = get_frame_choice(conn, folder, frames) if conn is not None else None
     return {
         "id": c["enc_id"],
+        "bird": bird,
+        "burst": c["enc_id"].partition("-")[0],
+        "mates": mates or [],
+        # an owner-drawn bird (not a detector extra) can be removed again
+        "added": bool(bird) and any(
+            f in boxes and iou(box, boxes[f]) >= 0.5 for f, box in (added or [])),
         "species": top1[0],
         "sci": top1[1],
         "time": c["time_start"][11:16],
@@ -613,6 +686,14 @@ def _enc_view(folder: str, c: dict, decision: dict | None,
     }
 
 
+def _mates(c: dict, by_burst: dict[str, list[dict]]) -> list[dict]:
+    """The birds a card shares its photos with: a primary names its extra
+    birds, an extra names its primary."""
+    mates = [m for m in by_burst.get(c["enc_id"].partition("-")[0], [])
+             if m is not c and (m.get("bird", 0) == 0) != (c.get("bird", 0) == 0)]
+    return [{"id": m["enc_id"], "species": m["adj_top3"][0][0]} for m in mates]
+
+
 def build_trip(folder: str, conn: sqlite3.Connection) -> dict:
     """Full trip view model: species groups + no-bird frames + decisions."""
     cands = load_candidates(folder)
@@ -623,6 +704,14 @@ def build_trip(folder: str, conn: sqlite3.Connection) -> dict:
     # frame lists from the cache, so pass them through to the encounter views
     # (task 12: the strip + lightbox step through every frame).
     frames_by_enc = {r.enc_id: list(r.frames) for r in refs}
+    # birds sharing a burst (several species in one burst, task 29)
+    by_burst: dict[str, list[dict]] = {}
+    for c in cands:
+        by_burst.setdefault(c["enc_id"].partition("-")[0], []).append(c)
+    gallery = dict(conn.execute(
+        "SELECT frame, bird_box FROM gallery_subject WHERE folder=?",
+        (folder,)).fetchall())
+    added = added_birds(conn, folder)
 
     # group by adjusted top-1 (the species the pipeline is showing)
     by_species: dict[str, list[dict]] = {}
@@ -634,7 +723,9 @@ def build_trip(folder: str, conn: sqlite3.Connection) -> dict:
     for key, encs in by_species.items():
         encs.sort(key=lambda e: e["time_start"])
         views = [_enc_view(folder, c, c["decision"], conn,
-                           frames_by_enc.get(c["enc_id"], c.get("frames")))
+                           frames_by_enc.get(c["enc_id"], c.get("frames")),
+                           mates=_mates(c, by_burst), gallery=gallery,
+                           added=added)
                  for c in encs]
         top1 = encs[0]["adj_top3"][0]
         best = max(views, key=lambda v: v["det_conf"])
@@ -896,6 +987,44 @@ def _per_frame_src(folder: str, frame: str) -> Path | None:
     try:
         image = load_photo(photo)
         save_frame_preview(image, None, dst)
+    except (RuntimeError, OSError):
+        return None
+    return dst
+
+
+def _bird_asset_path(kind: str, folder: str, enc_id: str, frame: str) -> Path:
+    return RUNS / folder / kind / "birds" / enc_id / f"{frame}.jpg"
+
+
+def _bird_frame_box(folder: str, enc_id: str, frame: str) -> Box | None:
+    """An extra bird's box in one frame, from its candidates.csv row."""
+    for c in load_candidates(folder):
+        if c["enc_id"] == enc_id:
+            b = (c.get("boxes") or {}).get(frame)
+            return Box(*b[:4], 0.0, "bird") if b else None
+    return None
+
+
+def _per_bird_asset(kind: str, folder: str, enc_id: str, frame: str) -> Path | None:
+    """Square crop (kind 'crops') or full frame with the box drawn ('frames')
+    of an extra bird in one frame, cut on first request and cached under runs/
+    (the pipeline clears these at the start of a run; boxes change per run)."""
+    if not (re.fullmatch(r"enc_\d+-\d+", enc_id) and frame
+            and "/" not in frame and frame != ".."):
+        return None
+    dst = _bird_asset_path(kind, folder, enc_id, frame)
+    if dst.is_file():
+        return dst
+    box = _bird_frame_box(folder, enc_id, frame)
+    photo = source_folder_for_trip(folder) / frame
+    if box is None or not photo.is_file():
+        return None
+    try:
+        image = load_photo(photo)
+        if kind == "crops":
+            save_crop(_crop_square(image, box), dst)
+        else:
+            save_frame_preview(image, box, dst)
     except (RuntimeError, OSError):
         return None
     return dst
@@ -1344,6 +1473,15 @@ def create_app(db_path: Path) -> Flask:
         # frame of an encounter, so the crop / box preview / box-less source
         # are generated on first request and cached under runs/. The nested
         # "frames/" segment must be matched before the enc-level source prefix.
+        # an extra bird's own crop / box preview per frame (task 29b)
+        for kind in ("crops", "frames"):
+            pre = f"{kind}/birds/"
+            if rel.startswith(pre) and rel.endswith(".jpg"):
+                enc_id, _, frame = rel[len(pre):-4].partition("/")
+                p = _per_bird_asset(kind, folder, enc_id, frame)
+                if p is None:
+                    abort(404)
+                return send_file(p)
         if rel.startswith("crops/frames/") and rel.endswith(".jpg"):
             p = _per_frame_crop(folder, rel[len("crops/frames/"):-4], g.db)
             if p is None:
@@ -1554,6 +1692,9 @@ def create_app(db_path: Path) -> Flask:
         c = _find_candidate(folder, enc_id)
         if c is None:
             return jsonify(ok=False, error="unknown encounter"), 404
+        if c.get("bird"):
+            return jsonify(ok=False, error="removing frames is not supported "
+                                           "for extra birds yet"), 400
         frames = list(c.get("frames") or [])
         if frame not in frames:
             return jsonify(ok=False, error=f"{frame} is not in this encounter"), 400
@@ -1588,6 +1729,9 @@ def create_app(db_path: Path) -> Flask:
         c = _find_candidate(folder, enc_id)
         if c is None or not (RUNS / folder / "candidates.csv").is_file():
             return jsonify(ok=False, error="unknown encounter"), 400
+        if c.get("bird"):
+            return jsonify(ok=False, error="crop fixes are not supported "
+                                           "for extra birds yet"), 400
         frame = p.get("frame") or c["best_frame"]
         old_top1 = c.get("top1") or (c["adj_top3"][0][0] if c["adj_top3"] else "")
         if undo:
@@ -1666,6 +1810,146 @@ def create_app(db_path: Path) -> Flask:
                        crop=f"/media/{folder}/crops/frames/{frame}.jpg",
                        frame=f"/media/{folder}/frames/frames/{frame}.jpg",
                        adj_top3=[[n, s, p] for n, s, p in fields["adj_top3"]])
+
+    @app.route("/api/bird/add", methods=["POST"])
+    def api_bird_add():
+        """Add a bird the detector missed (task 29b): store the drawn box in
+        added_birds (so a re-run keeps it as its own bird), re-identify the
+        crop on the CPU and give the burst a new candidates.csv row now."""
+        p = request.get_json(force=True) or {}
+        folder = p.get("folder") or ""
+        enc_id = p.get("enc_id") or ""
+        frame = p.get("frame") or ""
+        box_in = p.get("box")
+        c = _find_candidate(folder, enc_id) if folder else None
+        if c is None or c.get("nodet"):
+            return jsonify(ok=False, error="unknown encounter (a no-detection "
+                           "encounter becomes a bird by drawing a crop)"), 400
+        if frame not in (c.get("frames") or [c["best_frame"]]):
+            return jsonify(ok=False, error=f"{frame!r} is not one of this "
+                                           "encounter's frames"), 400
+        if not isinstance(box_in, (list, tuple)) or len(box_in) != 4:
+            return jsonify(ok=False, error="box must be [x1,y1,x2,y2]"), 400
+        try:
+            box = Box(*(float(v) for v in box_in), source="added")
+            W, H = _frame_size(folder, frame)
+        except (TypeError, ValueError):
+            return jsonify(ok=False, error="bad box"), 400
+        except FileNotFoundError:
+            return jsonify(ok=False, error="missing NEF"), 404
+        if not (0 <= box.x1 < box.x2 <= W and 0 <= box.y1 < box.y2 <= H):
+            return jsonify(ok=False, error="box outside frame"), 400
+        burst = enc_id.partition("-")[0]
+        rows = [r for r in load_candidates(folder)
+                if r["enc_id"].partition("-")[0] == burst]
+        # the pipeline folds a box over an existing bird into that bird, so
+        # refuse it here instead of listing the same bird twice until a re-run
+        for r in rows:
+            if r.get("bird"):
+                seen = (r.get("boxes") or {}).get(frame)
+            elif frame in (r.get("frames") or []):
+                sb = get_box(folder, frame, g.db)   # the primary's subject box
+                seen = to_list(sb) if sb else None
+            else:
+                seen = None
+            if seen and iou(to_list(box), seen) >= 0.5:
+                return jsonify(ok=False, error=f"{r['enc_id']} is already the "
+                                               "bird there"), 409
+        photo = source_folder_for_trip(folder) / frame
+        try:
+            crop = _crop_square(load_photo(photo), box)
+            from . import reid
+            fields = reid.identify_crop(folder, frame, crop)
+        except (FileNotFoundError, RuntimeError, OSError) as e:
+            return jsonify(ok=False, error=f"re-identify failed: {e}"), 500
+        add_bird(g.db, folder, frame, to_list(box))
+        n = max([r.get("bird", 0) for r in rows] + [0]) + 1
+        new_id = f"{burst}-{n}"
+        stamp = str((_frame_cache(folder, frame) or {}).get("timestamp") or "")
+        stamp = stamp.replace("T", " ")[:19] or c["time_start"]
+        _insert_candidate_row(folder, new_id, {
+            "time_start": stamp, "time_end": stamp, "n_frames": 1,
+            "best_frame": frame, "frames": [frame], "det_conf": 1.0,
+            "bird": n, "boxes": {frame: [round(v, 1) for v in to_list(box)]},
+        }, fields)
+        return jsonify(ok=True, enc_id=new_id, species=fields["top1"],
+                       elapsed=fields["elapsed"])
+
+    @app.route("/api/bird/remove", methods=["POST"])
+    def api_bird_remove():
+        """Undo "Add bird": drop the added_birds row(s), the candidates row and
+        any decision about that bird."""
+        p = request.get_json(force=True) or {}
+        folder = p.get("folder") or ""
+        enc_id = p.get("enc_id") or ""
+        c = _find_candidate(folder, enc_id) if folder else None
+        if c is None or not c.get("bird"):
+            return jsonify(ok=False, error="not an extra bird"), 400
+        mine = [(f, b) for f, b in added_birds(g.db, folder)
+                if f in (c.get("boxes") or {})
+                and iou(b, c["boxes"][f]) >= 0.5]
+        if not mine:
+            return jsonify(ok=False, error="this bird was found by the "
+                                           "detector, not added by hand"), 400
+        # decisions that resolve to this bird, found before its row goes away
+        refs = _enc_refs(folder, load_candidates(folder), [])
+        me = next(r for r in refs if r.enc_id == enc_id)
+        gone = 0
+        for d in _decisions_for(g.db, folder).values():
+            enc, _st = resolve_decision(d["best_frame"], d["frames"], refs,
+                                        d.get("bird_box", ""))
+            if enc is me:
+                g.db.execute("DELETE FROM decisions WHERE folder=? AND enc_id=? "
+                             "AND best_frame=?", (folder, d["enc_id"], d["best_frame"]))
+                gone += 1
+        for f, b in mine:
+            remove_added_bird(g.db, folder, f, b)
+        for fr, bb in g.db.execute(
+                "SELECT frame, bird_box FROM gallery_subject WHERE folder=?",
+                (folder,)).fetchall():
+            if bb and matches_bird_box(me, bb):
+                g.db.execute("DELETE FROM gallery_subject WHERE folder=? AND frame=?",
+                             (folder, fr))
+        g.db.commit()
+        _remove_candidate_row(folder, enc_id)
+        for sub in ("crops", "frames"):
+            shutil.rmtree(RUNS / folder / sub / "birds" / enc_id, ignore_errors=True)
+        return jsonify(ok=True, decisions_removed=gone)
+
+    @app.route("/api/gallery_subject", methods=["POST"])
+    def api_gallery_subject():
+        """Name a frame's gallery photo after this bird (a frame can hold
+        several confirmed birds); `clear` goes back to the automatic pick."""
+        p = request.get_json(force=True) or {}
+        folder = p.get("folder") or ""
+        enc_id = p.get("enc_id") or ""
+        frame = p.get("frame") or ""
+        c = _find_candidate(folder, enc_id) if folder else None
+        if c is None or c.get("nodet") or frame not in (c.get("frames") or []):
+            return jsonify(ok=False, error="unknown encounter / frame"), 400
+        if p.get("clear"):
+            g.db.execute("DELETE FROM gallery_subject WHERE folder=? AND frame=?",
+                         (folder, frame))
+            g.db.commit()
+            return jsonify(ok=True)
+        cands = load_candidates(folder)
+        _attach_decisions(folder, cands, [], _decisions_for(g.db, folder))
+        mine = next(x for x in cands if x["enc_id"] == enc_id)
+        dec = mine.get("decision")
+        if not dec or dec["action"] not in ("confirm", "change"):
+            return jsonify(ok=False, error="confirm the bird first"), 400
+        bb = ""
+        if c.get("bird"):
+            box = (c.get("boxes") or {}).get(frame)
+            if not box:
+                return jsonify(ok=False, error="no box for this frame"), 400
+            bb = bird_box_json(frame, box)
+        g.db.execute(
+            "INSERT OR REPLACE INTO gallery_subject (folder, frame, bird_box, "
+            "updated_at) VALUES (?,?,?,?)",
+            (folder, frame, bb, datetime.now().isoformat(timespec="seconds")))
+        g.db.commit()
+        return jsonify(ok=True, bird_box=bb)
 
     @app.route("/api/lifelist")
     def api_lifelist():

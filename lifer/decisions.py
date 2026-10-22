@@ -77,6 +77,18 @@ def bird_box_json(frame: str, box: list[float]) -> str:
     return json.dumps([frame, *[round(float(x), 1) for x in box[:4]]])
 
 
+def matches_bird_box(enc: EncRef, bird_box: str) -> bool:
+    """Whether a bird_box value (decisions, gallery_subject) names `enc`: ''
+    is the burst's primary bird, otherwise the extra bird whose box in the
+    stored frame overlaps the stored one (the same rule as resolve_decision)."""
+    bb = parse_bird_box(bird_box)
+    if bb is None:
+        return enc.bird == 0
+    frame, box = bb
+    return (enc.bird > 0 and frame in enc.boxes
+            and iou(box, enc.boxes[frame]) >= BIRD_BOX_IOU)
+
+
 def parse_frames(s: str | None) -> list[str]:
     """Parse the decisions.frames column (a JSON list; '' for legacy rows)."""
     if not s:
@@ -243,6 +255,35 @@ def current_encounters(home: Path, folder: str) -> list[EncRef]:
 # migrate-decisions
 # ---------------------------------------------------------------------------
 
+def _adj_top1s(home: Path, folder: str) -> dict[str, str]:
+    """enc_id -> adjusted top-1 species (lower case) of a run's candidates.csv."""
+    import csv
+    out: dict[str, str] = {}
+    c = Path(home) / "runs" / folder / "candidates.csv"
+    if c.is_file():
+        with open(c, newline="") as f:
+            for row in csv.DictReader(f):
+                first = (row.get("adj_top3") or "").split("; ")[0]
+                out[row["enc_id"]] = first.rsplit(" (", 1)[0].strip().lower()
+    return out
+
+
+def _split_target(d: sqlite3.Row, enc: EncRef, encs: list[EncRef],
+                  top1: dict[str, str]) -> EncRef | None:
+    """The one extra bird of `enc`'s burst that a decision without bird_box is
+    really about, or None. That is the case after a re-run split the burst:
+    the decision (confirm/change) still resolves to the primary, but its
+    species is no longer the primary's and is exactly one extra's top-1."""
+    species = (d["species"] or "").strip().lower()
+    if (d["action"] not in ("confirm", "change") or not species
+            or enc.bird != 0 or top1.get(enc.enc_id, species) == species):
+        return None
+    hits = [e for e in encs if e.bird > 0 and e.boxes
+            and e.enc_id.startswith(enc.enc_id + "-")
+            and top1.get(e.enc_id) == species]
+    return hits[0] if len(hits) == 1 else None
+
+
 def plan_migrate_decisions(home: Path, conn: sqlite3.Connection) -> dict[str, object]:
     """What `migrate-decisions` would do; nothing is touched.
 
@@ -264,6 +305,7 @@ def plan_migrate_decisions(home: Path, conn: sqlite3.Connection) -> dict[str, ob
     n_decisions = 0
     for (folder,) in conn.execute("SELECT DISTINCT folder FROM decisions ORDER BY folder"):
         encs = current_encounters(home, folder)
+        top1 = _adj_top1s(home, folder)
         for d in conn.execute(
                 "SELECT folder, enc_id, best_frame, action, species, frames, bird_box "
                 "FROM decisions WHERE folder=? ORDER BY enc_id, best_frame",
@@ -280,6 +322,22 @@ def plan_migrate_decisions(home: Path, conn: sqlite3.Connection) -> dict[str, ob
                     "folder": folder, "enc_id": d["enc_id"],
                     "frame": d["best_frame"], "action": d["action"],
                     "species": d["species"], "reason": reason,
+                })
+                continue
+            extra = None if d["bird_box"] else _split_target(d, enc, encs, top1)
+            if extra is not None:
+                # re-attach to the extra by its best frame + box there
+                bf = extra.best_frame if extra.best_frame in extra.boxes \
+                    else next(iter(extra.boxes))
+                entries.append({
+                    "folder": folder, "enc_id": d["enc_id"],
+                    "frame": d["best_frame"], "action": d["action"],
+                    "species": d["species"],
+                    "new_enc_id": extra.enc_id, "new_frame": extra.best_frame,
+                    "new_frames": list(extra.frames) or [extra.best_frame],
+                    "changed": True, "had_frames": bool(frames),
+                    "conflict": False, "to_extra": True,
+                    "bird_box": bird_box_json(bf, extra.boxes[bf]),
                 })
                 continue
             same_key = (enc.enc_id == d["enc_id"]
@@ -327,10 +385,12 @@ def apply_migrate_decisions(home: Path, conn: sqlite3.Connection) -> dict[str, o
                 e["conflict"] = True
                 continue
         conn.execute(
-            "UPDATE decisions SET enc_id=?, best_frame=?, frames=? "
+            "UPDATE decisions SET enc_id=?, best_frame=?, frames=?, "
+            "bird_box=COALESCE(?, bird_box) "
             "WHERE folder=? AND enc_id=? AND best_frame=?",
             (e["new_enc_id"], e["new_frame"],
              frames_json(cast("list[str]", e["new_frames"])),
+             e.get("bird_box"),   # only a split decision sets one
              e["folder"], e["enc_id"], e["frame"]))
     conn.commit()
     plan["applied"] = sum(1 for e in entries if not e["conflict"])

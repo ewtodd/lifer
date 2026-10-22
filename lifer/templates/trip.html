@@ -38,6 +38,15 @@
 .lb-fpos { font-size:.78rem; color:#9aa; text-align:center; margin-top:4px;
      font-family:ui-monospace,Menlo,monospace; }
 .lb-meta.nbox { color:#f0a; }
+/* task 29b: several species in one burst */
+.enc-mates { margin-top:6px; font-size:.74rem; color:var(--muted); }
+.mate-chip { display:inline-block; margin:0 4px 2px 0; padding:1px 8px; border-radius:999px;
+     border:1px solid var(--border); background:var(--bar-track); color:var(--fg);
+     font-size:.72rem; text-decoration:none; cursor:pointer; }
+.mate-chip:hover { border-color:var(--bar); }
+.enc.flash { outline:2px solid var(--bar); outline-offset:2px; }
+.lb-also { font-size:.78rem; color:#9aa; margin-top:2px; }
+.lb-also a { color:#cfd6df; cursor:pointer; }
 </style>
 </head>
 <body>
@@ -100,6 +109,15 @@
             {% if e.has_override %}<span class="badge rare" title="crop overridden">crop fixed</span>{% endif %}
             {% if e.reid %}<span class="badge reid">re-identified: {{ e.reid.old }} &rarr; {{ e.reid.new }}</span>{% endif %}
           </div>
+          {% if e.mates %}
+          <div class="enc-mates">
+            {% if e.bird %}also in
+            {% for m in e.mates %}<a class="mate-chip" href="#" data-goto="{{ m.id }}" title="{{ m.species }}">{{ m.id }}</a>{% endfor %}
+            {% else %}also in this burst:
+            {% for m in e.mates %}<a class="mate-chip" href="#" data-goto="{{ m.id }}">{{ m.species }}</a>{% endfor %}
+            {% endif %}
+          </div>
+          {% endif %}
           <ul class="top3">
             {% for common, sci, p in e.adj_top3 %}
             <li title="raw {{ "%.3f" | format(e.raw_map.get(common, -1)) if common in e.raw_map else "n/a" }}">
@@ -123,6 +141,8 @@
             <button class="btn sm" data-edit-dt data-enc="{{ e.id }}"
                     title="Hand off this encounter's chosen frame and open it in darktable">Edit in darktable</button>
             <button class="btn sm" data-clear="{{ e.id }}" {% if not e.decision %}hidden{% endif %}>Undo</button>
+            {% if e.added %}<button class="btn sm" data-rm-bird="{{ e.id }}"
+                    title="Delete this hand-added bird (and any decision about it)">Remove added bird</button>{% endif %}
           </div>
           <div class="enc-frames">
             {% for f in e.frames %}
@@ -131,8 +151,8 @@
               <img src="{{ f.crop }}" loading="lazy" alt="{{ f.name }}"
                    title="{{ f.name }} &middot; sharpness {{ f.sharp if f.sharp > 0 else 'n/a' }}"
                    data-g="{{ gi }}" data-e="{{ enc_i }}" data-fi="{{ loop.index0 }}">
-              <button class="rm-frame" data-rm-frame="{{ f.name }}" data-enc="{{ e.id }}"
-                      title="Drop this frame from the encounter">&times;</button>
+              {% if not e.bird %}<button class="rm-frame" data-rm-frame="{{ f.name }}" data-enc="{{ e.id }}"
+                      title="Drop this frame from the encounter">&times;</button>{% endif %}
               <figcaption>{% if f.sharp > 0 %}{{ f.sharp }}{% else %}no box{% endif %}</figcaption>
             </figure>
             {% endfor %}
@@ -183,6 +203,7 @@
       <button class="btn" id="lb-save-note">Save note</button>
       <button class="btn" id="lb-clear" hidden>Undo</button>
       <button class="btn" id="lb-fixcrop">Fix crop</button>
+      <button class="btn" id="lb-gallery">Gallery: this bird</button>
       <button class="btn" id="lb-use">Use this photo</button>
       <button class="btn" id="lb-edit">Open in darktable</button>
       <button class="btn" id="lb-enc-prev" title="Previous encounter" aria-label="Previous encounter">&#8249; enc</button>
@@ -199,6 +220,8 @@
     <div class="ce-hint" id="ce-hint">Click an outlined bird, or drag to draw a new crop</div>
     <div class="ce-btns">
       <button class="btn primary" id="ce-save">Save crop</button>
+      <button class="btn" id="ce-addbird"
+              title="The drawn box is a second bird in this burst; it gets its own card and species">Add as another bird</button>
       <button class="btn" id="ce-undo" hidden>Undo crop fix</button>
       <button class="btn" id="ce-cancel">Cancel</button>
     </div>
@@ -399,6 +422,8 @@ function renderLb() {
     $('lb-img').src = n.thumb;
     $('lb-toggle').style.display = 'none';
     $('lb-fixcrop').style.display = n.enc ? '' : 'none';
+    $('lb-fixcrop').disabled = false; $('lb-fixcrop').title = '';
+    $('lb-gallery').style.display = 'none';
     let cap = '<div class="lb-title">No bird detected</div>';
     if (n.enc)
       cap += '<div class="lb-meta">' + esc(n.file) + ' &middot; ' + n.time +
@@ -414,7 +439,15 @@ function renderLb() {
   const e = encAt(cur.gi, cur.ei);
   const frames = e.frames || [];
   const f = frames[cur.fi] || e;
+  // crop fixes, frame removal and Add bird work on the burst's primary bird only
   $('lb-fixcrop').style.display = '';
+  $('lb-fixcrop').disabled = !!e.bird;
+  $('lb-fixcrop').title = e.bird ? 'Not supported for extra birds yet' : '';
+  const gb = $('lb-gallery'), confirmed = !!(e.decision && (e.decision.action === 'confirm' || e.decision.action === 'change'));
+  gb.style.display = confirmed ? '' : 'none';
+  gb.textContent = f.gallery ? 'Gallery bird \u2713' : 'Gallery: this bird';
+  gb.title = f.gallery ? 'The gallery names this photo after this bird; click to go back to the automatic pick'
+                       : 'Name the gallery photo of this frame after this bird (a frame can hold several)';
   $('lb-img').src = (showCrop && f.crop) ? f.crop : f.frame;
   $('lb-toggle').style.display = (f.has_box && f.crop && f.frame) ? '' : 'none';
   $('lb-toggle').textContent = showCrop ? 'Show full frame' : 'Show crop';
@@ -425,6 +458,11 @@ function renderLb() {
     cap += '<div class="lb-badges">' + e.badges.map(function (b) { return badgeHtml(b, e); }).join('') + '</div>';
   if (e.rare_evidence)
     cap += '<div class="lb-ev">' + esc(e.rare_evidence) + '</div>';
+  if (e.mates && e.mates.length)
+    cap += '<div class="lb-also">' + (e.bird ? 'also in ' : 'also in this burst: ') +
+      e.mates.map(function (m) {
+        return '<a data-goto="' + esc(m.id) + '">' + esc(e.bird ? m.id : m.species) + '</a>';
+      }).join(' &middot; ') + '</div>';
   cap += '<div class="lb-line">Adjusted: ' + fmtTop3(e.adj_top3) + '</div>';
   cap += '<div class="lb-line muted">Raw: ' + fmtTop3(e.raw_top3) + '</div>';
   cap += '<div class="lb-line" style="margin-top:8px">' + decChip(e) + '</div>';
@@ -547,6 +585,10 @@ document.addEventListener('click', function (e2) {
   if (edt) { openDarktable(FOLDER, edt.dataset.enc); return; }
   const rmf = e2.target.closest('[data-rm-frame]');
   if (rmf) { removeFrame(FOLDER, rmf.dataset.enc, rmf.dataset.rmFrame); return; }
+  const rmb = e2.target.closest('[data-rm-bird]');
+  if (rmb) { removeBird(rmb.dataset.rmBird); return; }
+  const gt = e2.target.closest('[data-goto]');
+  if (gt) { e2.preventDefault(); gotoEnc(gt.dataset.goto); return; }
   if (e2.target.id === 'lb-backdrop') closeLb();
 });
 function encAtByEncId(id) {
@@ -617,6 +659,56 @@ async function openDarktable(folder, encId) {
     flashToast('Error: ' + e2, true);
   }
 }
+// jump to another bird's card (a burst-mate chip), opening its group
+function gotoEnc(id) {
+  for (let gi = 0; gi < DATA.groups.length; gi++) {
+    const ei = DATA.groups[gi].encs.findIndex(function (x) { return x.id === id; });
+    if (ei < 0) continue;
+    if (cur) closeLb();
+    const box = document.querySelector('[data-gencs="' + gi + '"]');
+    if (box && box.hidden) document.querySelector('[data-expand="' + gi + '"]').click();
+    const row = document.querySelector('[data-encrow="' + id + '"]');
+    if (row) {
+      row.scrollIntoView({ block: 'center' });
+      row.classList.add('flash');
+      setTimeout(function () { row.classList.remove('flash'); }, 1800);
+    }
+    return;
+  }
+}
+async function removeBird(encId) {
+  if (!window.confirm('Remove the added bird ' + encId + ' and any decision about it?')) return;
+  const r = await fetch('/api/bird/remove', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder: FOLDER, enc_id: encId })
+  });
+  const j = await r.json().catch(function () { return {}; });
+  if (r.ok && j.ok) location.reload();
+  else alert('Remove failed: ' + (j.error || r.status));
+}
+// the gallery names a frame's photo after one of its confirmed birds
+$('lb-gallery').addEventListener('click', async function () {
+  if (!cur || cur.type !== 'enc') return;
+  const e = encAt(cur.gi, cur.ei);
+  const f = (e.frames || [])[cur.fi];
+  if (!f) return;
+  const clear = !!f.gallery;
+  const r = await fetch('/api/gallery_subject', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder: FOLDER, enc_id: e.id, frame: f.name, clear: clear })
+  });
+  const j = await r.json().catch(function () { return {}; });
+  if (!r.ok || !j.ok) { alert('Gallery subject failed: ' + (j.error || r.status)); return; }
+  // one bird per frame: flip the same photo in every card that shows it
+  DATA.groups.forEach(function (gr) {
+    gr.encs.forEach(function (x) {
+      (x.frames || []).forEach(function (fx) {
+        if (fx.name === f.name) fx.gallery = !clear && x.id === e.id;
+      });
+    });
+  });
+  renderLb();
+});
 async function removeFrame(folder, encId, frame) {
   if (!window.confirm('Remove frame ' + frame + ' from this encounter?')) return;
   try {
@@ -736,6 +828,8 @@ async function openCrop() {
   if (!e) return;
   $('ce').style.display = 'flex';
   $('ce-undo').hidden = true;
+  // "No bird detected": drawing already makes it a bird; extra birds: not yet
+  $('ce-addbird').hidden = cur.type !== 'enc' || !!e.bird;
   $('ce-hint').textContent = 'Loading\u2026';
   let j;
   const framep = fname ? '&frame=' + encodeURIComponent(fname) : '';
@@ -790,6 +884,25 @@ $('ce-save').addEventListener('click', async function () {
   if (!r.ok || !j.ok) { alert('Crop save failed: ' + (j.error || r.status)); return; }
   closeCrop();
   window.location.reload();
+});
+$('ce-addbird').addEventListener('click', async function () {
+  if (!cur || !cropState) return;
+  if (!selBox) { alert('Draw a box around the other bird first'); return; }
+  const btn = $('ce-addbird'), label = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Identifying\u2026';
+  try {
+    const r = await fetch('/api/bird/add', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder: FOLDER, enc_id: cropState.enc.id, frame: cropState.frame,
+        box: [selBox[0], selBox[1], selBox[2], selBox[3]] })
+    });
+    const j = await r.json().catch(function () { return {}; });
+    if (!r.ok || !j.ok) { alert('Add bird failed: ' + (j.error || r.status)); return; }
+    closeCrop();
+    window.location.reload();
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
 });
 (function () {
   const c = $('ce-canvas');

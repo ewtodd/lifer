@@ -115,7 +115,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(gal, "_capture_time",
                         lambda p: times.get(p.name))
 
-    def fake_render(export, folder, frame, out_full, out_thumb, conn):
+    def fake_render(export, folder, frame, out_full, out_thumb, conn,
+                    bird_box=None):
         out_full.parent.mkdir(parents=True, exist_ok=True)
         out_full.write_bytes(b"jpg")
         out_thumb.write_bytes(b"thumb")

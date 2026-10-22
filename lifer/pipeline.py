@@ -11,6 +11,7 @@ from __future__ import annotations
 import calendar
 import hashlib
 import json
+import shutil
 import sys
 import time
 import tomllib
@@ -513,6 +514,10 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
     for sub in ("crops", "frames", "frames/src"):  # extra birds are rebuilt below
         for stale in (out_dir / sub).glob("enc_*-*.jpg"):
             stale.unlink()
+    # the review app cuts per-frame crops/previews of extra birds on demand
+    # (crops/birds/<enc_id>/<frame>.jpg); their boxes change with every run
+    for sub in ("crops/birds", "frames/birds"):
+        shutil.rmtree(out_dir / sub, ignore_errors=True)
     cands: list[Candidate] = []
     nodet_encs: list[dict[str, object]] = []  # encounters with no usable detection
     nodet_frames: set[str] = set()  # their frames, for the thumbnail pass below

@@ -413,6 +413,11 @@ def _print_migrate_decisions(res: dict[str, Any]) -> None:
             if e["conflict"]:
                 print(f"    CONFLICT (left in place): {e['enc_id']} {e['frame']} "
                       f"-> {e['new_enc_id']} {e['new_frame']} already occupied")
+            elif e.get("to_extra"):
+                print(f"    split {e['enc_id']} {e['frame']} "
+                      f"-> extra bird {e['new_enc_id']} {e['new_frame']} "
+                      f"({e['action']} {e['species'] or '-'}, "
+                      f"bird_box {e['bird_box']})")
             elif e["changed"]:
                 print(f"    reattach {e['enc_id']} {e['frame']} "
                       f"-> {e['new_enc_id']} {e['new_frame']} "

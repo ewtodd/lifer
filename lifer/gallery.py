@@ -13,6 +13,11 @@ frame - by raw filename AND capture time (EXIF), so the same filename in two
 trips/folders cannot collide. Photos that are rated but not exported or not
 (yet) confirmed are skipped and counted.
 
+A frame can hold several confirmed birds (a burst with several species). The
+photo is named after, in order: the bird the owner chose for that frame in the
+review app (``gallery_subject``); else the bird whose box in the frame is
+nearest the camera's AF point; else the burst's primary bird.
+
 Output: ``data/gallery.json`` (species, scientific, date, place, file, thumb,
 width, height; newest first) plus a 2400px watermarked JPEG (q88, all metadata
 stripped) and a 500px un-watermarked thumbnail in ``static/birds/gallery/``.
@@ -34,10 +39,14 @@ from typing import Any
 import rawpy
 from PIL import Image
 
+from .boxes import Box
 from .config import load_config
+from .decisions import (EncRef, ensure_bird_box_column, matches_bird_box,
+                        parse_frames, resolve_decision)
 from .home import lifer_home, source_folder_for_trip
+from .subject import box_distance
 from .watermark import Watermark, apply_watermark
-from .web import _init_db, load_candidates, region_name
+from .web import _enc_refs, _frame_cache, _init_db, load_candidates, region_name
 
 RATING = 5                      # xmp:Rating value that puts a photo in the gallery
 LONG_EDGE = 2400                # px, photo long edge
@@ -129,36 +138,103 @@ def _capture_time(path: Path) -> datetime | None:
     return ts
 
 
-def _frame_index(conn: sqlite3.Connection, needed: set[str]) -> dict[str, list[tuple[datetime, dict]]]:
-    """Confirmed decisions that contain any needed raw, keyed by raw filename.
+def _folder_refs(folder: str, cache: dict[str, list[EncRef]]) -> list[EncRef]:
+    """The trip's current birds (primaries and extras) with their frame lists
+    and boxes, for resolving decisions. Empty when the run is gone."""
+    refs = cache.get(folder)
+    if refs is None:
+        try:
+            refs = _enc_refs(folder, load_candidates(folder), [])
+        except (OSError, ValueError):
+            refs = []
+        for r in refs:
+            r.frames = r.frames or [r.best_frame]   # runs without a frames column
+        cache[folder] = refs
+    return refs
 
-    Each value is ``[(capture_time, decision), ...]`` so a sidecar can pick the
-    decision whose capture time matches its own raw. ``decision`` carries the
-    row plus the encounter's time_start date.
+
+def _frame_index(conn: sqlite3.Connection, needed: set[str]) -> dict[str, list[tuple[datetime, dict]]]:
+    """Confirmed birds that contain any needed raw, keyed by raw filename.
+
+    Each value is ``[(capture_time, bird), ...]`` so a sidecar can pick the
+    birds whose capture time matches its own raw. A decision is resolved to
+    the current run's bird (``resolve_decision``), so an extra bird of a burst
+    is told apart from its primary even though they share frames. ``bird`` has
+    the species, the encounter's date, its ``ref`` (frames + boxes) and the
+    decision's folder/enc_id.
     """
     idx: dict[str, list[tuple[datetime, dict[str, Any]]]] = {}
     if not needed:
         return idx
     date_cache: dict[str, dict[str, Any]] = {}
+    refs_cache: dict[str, list[EncRef]] = {}
+    seen: set[tuple[str, str]] = set()
     for d in conn.execute(
-            "SELECT folder, enc_id, species, scientific, frames FROM decisions "
-            "WHERE action IN ('confirm','change')"):
-        frames = json.loads(d["frames"] or "[]")
-        date = _encounter_date(d["folder"], d["enc_id"], date_cache)
+            "SELECT folder, enc_id, best_frame, species, scientific, frames, "
+            "bird_box FROM decisions WHERE action IN ('confirm','change')"):
+        folder = d["folder"]
+        refs = _folder_refs(folder, refs_cache)
+        frames = parse_frames(d["frames"])
+        ref = None
+        if refs:
+            ref, _status = resolve_decision(d["best_frame"], frames, refs,
+                                            d["bird_box"])
+            if ref is None:
+                continue
+            frames = ref.frames
+        if ref is None:                  # run gone: the stored frames will do
+            ref = EncRef(d["enc_id"], d["best_frame"], frames)
+        if (folder, ref.enc_id) in seen:
+            continue
+        seen.add((folder, ref.enc_id))
         rec: dict[str, Any] = {
-            "folder": d["folder"], "enc_id": d["enc_id"],
+            "folder": folder, "enc_id": ref.enc_id, "ref": ref,
             "species": d["species"], "scientific": d["scientific"],
-            "date": date,
+            "date": _encounter_date(folder, ref.enc_id, date_cache),
         }
         for fr in frames:
             if fr not in needed:
                 continue
-            src = source_folder_for_trip(d["folder"]) / fr
+            src = source_folder_for_trip(folder) / fr
             t = _capture_time(src)
             if t is None:
                 continue
             idx.setdefault(fr, []).append((t, rec))
     return idx
+
+
+def _bird_box(rec: dict[str, Any], frame: str, conn: sqlite3.Connection):
+    """[x1, y1, x2, y2] of a bird in a frame: an extra's own box, a primary's
+    subject (owner override, else the AF-point detection)."""
+    ref: EncRef = rec["ref"]
+    if ref.bird:
+        return ref.boxes.get(frame)
+    box = _get_box(conn, rec["folder"], frame)
+    return [box.x1, box.y1, box.x2, box.y2] if box else None
+
+
+def pick_subject(birds: list[dict[str, Any]], folder: str, frame: str,
+                 conn: sqlite3.Connection) -> dict[str, Any]:
+    """Which of a frame's confirmed birds the gallery photo is named after:
+    the owner's choice, else the one nearest the AF point, else the primary."""
+    if len(birds) == 1:
+        return birds[0]
+    row = conn.execute(
+        "SELECT bird_box FROM gallery_subject WHERE folder=? AND frame=?",
+        (folder, frame)).fetchone()
+    if row is not None:
+        chosen = [b for b in birds if matches_bird_box(b["ref"], row["bird_box"])]
+        if chosen:
+            return chosen[0]
+    cache = _frame_cache(folder, frame) or {}
+    af, w, h = cache.get("af"), cache.get("width"), cache.get("height")
+    if af and w and h:
+        px, py = af[0] * w, af[1] * h
+        near = [(box_distance(box, px, py), b["ref"].bird, b) for b in birds
+                if (box := _bird_box(b, frame, conn))]
+        if near:
+            return min(near, key=lambda t: t[:2])[2]
+    return next((b for b in birds if not b["ref"].bird), birds[0])
 
 
 def _encounter_date(folder: str, enc_id: str, cache: dict[str, dict[str, Any]]) -> str:
@@ -185,7 +261,8 @@ def _full_frame_size(src: Path) -> tuple[int, int] | None:
 
 
 def _bird_in_export(folder: str, frame: str, src: Path, out_size: tuple[int, int],
-                    conn: sqlite3.Connection) -> tuple[float, float, float, float] | None:
+                    conn: sqlite3.Connection,
+                    bird_box: list[float] | None = None) -> tuple[float, float, float, float] | None:
     """The bird box mapped into the export's pixel coords, or None.
 
     The owner's export is already a finished crop. When we can determine that
@@ -193,7 +270,10 @@ def _bird_in_export(folder: str, frame: str, src: Path, out_size: tuple[int, int
     the detection box by scale; otherwise we cannot know where the crop sits
     and we leave placement to the watermark's calmest-corner fallback (None).
     """
-    box = _get_box(conn, folder, frame)
+    if bird_box is not None:
+        box = Box(*bird_box[:4])
+    else:
+        box = _get_box(conn, folder, frame)
     if box is None:
         return None
     full = _full_frame_size(src)
@@ -228,12 +308,14 @@ def _save_jpeg(image: Image.Image, path: Path, quality: int) -> None:
 
 
 def _render(export: Path, folder: str, frame: str, out_full: Path, out_thumb: Path,
-            conn: sqlite3.Connection) -> tuple[int, int]:
-    """Write the watermarked full photo and its thumbnail."""
+            conn: sqlite3.Connection,
+            bird_box: list[float] | None = None) -> tuple[int, int]:
+    """Write the watermarked full photo and its thumbnail. ``bird_box`` is the
+    named bird's box when it is an extra bird (else the primary's subject)."""
     img = Image.open(export).convert("RGB")
     full_img = _downscale(img, LONG_EDGE)
     src = source_folder_for_trip(folder) / frame
-    bird = _bird_in_export(folder, frame, src, full_img.size, conn)
+    bird = _bird_in_export(folder, frame, src, full_img.size, conn, bird_box)
     full_img = apply_watermark(full_img, bird, Watermark.from_config())
     _save_jpeg(full_img, out_full, JPEG_Q)
     _save_jpeg(_downscale(img, THUMB_EDGE), out_thumb, THUMB_Q)
@@ -256,6 +338,7 @@ def publish_gallery(site: Path, db_path: Path) -> dict:
     _init_db(db_path)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    ensure_bird_box_column(conn)
 
     cfg = load_config()
     roots = _roots(cfg)
@@ -285,21 +368,22 @@ def publish_gallery(site: Path, db_path: Path) -> dict:
                 continue
             raw_path = sc.parent / raw_name
             spot = _capture_time(raw_path)
-            match = None
-            if spot is not None:
-                for dt, d in idx.get(raw_name, []):
-                    if dt == spot:
-                        match = d
-                        break
-            if match is None:
+            same_shot = [d for dt, d in idx.get(raw_name, [])
+                         if spot is not None and dt == spot]
+            if not same_shot:
                 rated_not_confirmed += 1
                 continue
-
-            folder, frame = match["folder"], raw_name
+            # a frame can hold several confirmed birds; one trip per photo
+            folder, frame = same_shot[0]["folder"], raw_name
+            match = pick_subject([d for d in same_shot if d["folder"] == folder],
+                                 folder, frame, conn)
+            ref: EncRef = match["ref"]
+            bird_box = ref.boxes.get(frame) if ref.bird else None
             slug = f"{folder}_{_stem(sc)}"
             out_full = gal_dir / f"{slug}.jpg"
             out_thumb = gal_dir / f"{slug}-thumb.jpg"
-            width, height = _render(export, folder, frame, out_full, out_thumb, conn)
+            width, height = _render(export, folder, frame, out_full, out_thumb, conn,
+                                    bird_box)
             entries.append({
                 "species": match["species"],
                 "scientific": match["scientific"],
