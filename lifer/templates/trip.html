@@ -30,6 +30,11 @@
 .enc-frame.chosen figcaption { color:var(--bar); font-weight:700; }
 .enc-frame .fmark { position:absolute; left:2px; top:2px; background:#171a20;
      color:#ffc400; font-size:.6rem; padding:0 3px; border-radius:2px; }
+.enc-frame .rm-frame { position:absolute; right:2px; top:2px; width:18px; height:18px;
+     line-height:1; border:0; border-radius:3px; background:rgba(179,38,30,.9);
+     color:#fff; font-size:.85rem; cursor:pointer; opacity:0; transition:opacity .1s; }
+.enc-frame:hover .rm-frame { opacity:1; }
+.enc-frame .rm-frame:hover { background:#c62828; }
 .lb-fpos { font-size:.78rem; color:#9aa; text-align:center; margin-top:4px;
      font-family:ui-monospace,Menlo,monospace; }
 .lb-meta.nbox { color:#f0a; }
@@ -44,6 +49,8 @@
     <span class="counts-prog" id="progress"></span>
     <label class="toggle"><input type="checkbox" id="hideDecided"> hide decided</label>
     <a href="/lifelist">Lifelist</a>
+    <button class="btn sm" data-open-dt
+            title="Hand off this trip's confirmed frames and open them in darktable">Open in darktable</button>
     <button class="btn sm" data-delete="{{ t.folder }}"
             title="Delete this trip's runs, cache, and decisions">Delete trip</button>
   </nav>
@@ -113,6 +120,8 @@
             <button class="btn sm" data-act="unsure" data-enc="{{ e.id }}">Unsure</button>
             <input class="note-input" data-notein="{{ e.id }}" placeholder="note" value="{{ e.decision.note if e.decision else '' }}">
             <button class="btn sm" data-save-note="{{ e.id }}">Save note</button>
+            <button class="btn sm" data-edit-dt data-enc="{{ e.id }}"
+                    title="Hand off this encounter's chosen frame and open it in darktable">Edit in darktable</button>
             <button class="btn sm" data-clear="{{ e.id }}" {% if not e.decision %}hidden{% endif %}>Undo</button>
           </div>
           <div class="enc-frames">
@@ -122,6 +131,8 @@
               <img src="{{ f.crop }}" loading="lazy" alt="{{ f.name }}"
                    title="{{ f.name }} &middot; sharpness {{ f.sharp if f.sharp > 0 else 'n/a' }}"
                    data-g="{{ gi }}" data-e="{{ enc_i }}" data-fi="{{ loop.index0 }}">
+              <button class="rm-frame" data-rm-frame="{{ f.name }}" data-enc="{{ e.id }}"
+                      title="Drop this frame from the encounter">&times;</button>
               <figcaption>{% if f.sharp > 0 %}{{ f.sharp }}{% else %}no box{% endif %}</figcaption>
             </figure>
             {% endfor %}
@@ -173,6 +184,7 @@
       <button class="btn" id="lb-clear" hidden>Undo</button>
       <button class="btn" id="lb-fixcrop">Fix crop</button>
       <button class="btn" id="lb-use">Use this photo</button>
+      <button class="btn" id="lb-edit">Open in darktable</button>
       <button class="btn" id="lb-enc-prev" title="Previous encounter" aria-label="Previous encounter">&#8249; enc</button>
       <button class="btn" id="lb-enc-next" title="Next encounter" aria-label="Next encounter">enc &#8250;</button>
       <div class="lb-hint">C confirm &middot; U unsure &middot; X not identifiable &middot; N next undecided &middot; &#8592;/&#8594; frames &middot; Shift+arrows encounter</div>
@@ -529,6 +541,12 @@ document.addEventListener('click', function (e2) {
   }
   const cl = e2.target.closest('[data-clear]');
   if (cl) { const e = encAtByEncId(cl.dataset.clear); if (e) sendDecision(e, 'clear'); return; }
+  const odt = e2.target.closest('[data-open-dt]');
+  if (odt) { openDarktable(FOLDER, ''); return; }
+  const edt = e2.target.closest('[data-edit-dt]');
+  if (edt) { openDarktable(FOLDER, edt.dataset.enc); return; }
+  const rmf = e2.target.closest('[data-rm-frame]');
+  if (rmf) { removeFrame(FOLDER, rmf.dataset.enc, rmf.dataset.rmFrame); return; }
   if (e2.target.id === 'lb-backdrop') closeLb();
 });
 function encAtByEncId(id) {
@@ -564,6 +582,52 @@ document.getElementById('lb-use').addEventListener('click', async function () {
 document.getElementById('lb-toggle').addEventListener('click', function () {
   if (cur && cur.type === 'enc') { showCrop = !showCrop; renderLb(); }
 });
+document.getElementById('lb-edit').addEventListener('click', function () {
+  if (cur && cur.type === 'enc') {
+    openDarktable(FOLDER, DATA.groups[cur.gi].encs[cur.ei].id);
+  }
+});
+function flashToast(msg, isErr) {
+  const el = document.createElement('div');
+  el.textContent = msg;
+  el.style.cssText = 'position:fixed;left:50%;bottom:2rem;transform:translateX(-50%);' +
+    'background:' + (isErr ? '#b3261e' : 'rgba(0,0,0,.85)') + ';color:#fff;padding:.7rem 1.1rem;' +
+    'border-radius:8px;z-index:10000;max-width:80vw;box-shadow:0 4px 14px rgba(0,0,0,.4);';
+  document.body.appendChild(el);
+  setTimeout(function () { el.remove(); }, 2200);
+}
+async function openDarktable(folder, encId) {
+  flashToast('Handing off to darktable\u2026');
+  try {
+    const r = await fetch('/api/open_darktable', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(encId ? { folder: folder, enc_id: encId } : { folder: folder })
+    });
+    const j = await r.json().catch(function () { return {}; });
+    if (r.ok && j.ok) {
+      flashToast('Opened in darktable \u00b7 ' + j.copied + ' frame' + (j.copied === 1 ? '' : 's') +
+        (j.skipped ? ' \u00b7 ' + j.skipped + ' already there' : ''));
+    } else {
+      flashToast('Could not open darktable: ' + (j.error || r.status), true);
+    }
+  } catch (e2) {
+    flashToast('Error: ' + e2, true);
+  }
+}
+async function removeFrame(folder, encId, frame) {
+  if (!window.confirm('Remove frame ' + frame + ' from this encounter?')) return;
+  try {
+    const r = await fetch('/api/frame/remove', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder: folder, enc_id: encId, frame: frame })
+    });
+    const j = await r.json().catch(function () { return {}; });
+    if (r.ok && j.ok) { location.reload(); }
+    else { alert('Remove failed: ' + (j.error || r.status)); }
+  } catch (e2) {
+    alert('Error: ' + e2);
+  }
+}
 $('hideDecided').addEventListener('change', function (e2) {
   hideDecided = e2.target.checked;
   DATA.groups.forEach(function (_gr, gi) { applyHideDecided(gi); });

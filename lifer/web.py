@@ -920,6 +920,42 @@ def _rewrite_candidate(folder: str, enc_id: str, fields: dict) -> None:
             w.writerows(rows)
 
 
+def _remove_candidate_frame(folder: str, enc_id: str, frame: str) -> tuple[list[str], str]:
+    """Drop ``frame`` from an encounter's frame set in candidates.csv, updating
+    ``frames``/``n_frames`` and re-picking ``best_frame`` if it was removed.
+    Returns (new_frames, new_best). Raises ValueError if the frame isn't there."""
+    path = RUNS / folder / "candidates.csv"
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or [
+            "enc_id", "time_start", "time_end", "n_frames", "best_frame",
+            "det_conf", "raw_top3", "adj_top3", "possible_lifer",
+            "lifer_lookalike", "rare_here", "rare_evidence"]
+        rows = list(reader)
+    new_best = None
+    target = None
+    for r in rows:
+        if r["enc_id"] == enc_id:
+            frames = [x for x in (r.get("frames") or "").split(",") if x]
+            if frame not in frames:
+                raise ValueError(f"{frame} is not in encounter {enc_id}")
+            new_frames = [x for x in frames if x != frame]
+            r["frames"] = ",".join(new_frames)
+            r["n_frames"] = str(len(new_frames))
+            if r["best_frame"] == frame:
+                r["best_frame"] = new_frames[0] if new_frames else frame
+                new_best = r["best_frame"]
+            target = new_frames
+            break
+    if target is None:
+        raise ValueError(f"unknown encounter {enc_id}")
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+    return target, new_best or ""
+
+
 def _snapshot_fields(c: dict) -> str:
     """JSON encoding of the pre-fix candidate fields (for Undo)."""
     return json.dumps({
@@ -1405,6 +1441,60 @@ def create_app(db_path: Path) -> Flask:
             return jsonify(ok=False, error=f"{frame!r} is not one of this encounter's frames"), 400
         set_frame_choice(g.db, folder, enc_frames, frame)
         return jsonify(ok=True, chosen_frame=frame, frames=sorted(enc_frames))
+
+    @app.route("/api/open_darktable", methods=["POST"])
+    def api_open_darktable():
+        """Hand off a trip's (or one encounter's) confirmed frames to
+        ~/Pictures/<trip> and launch darktable on it for editing."""
+        from . import handoff as hnd
+        p = request.get_json(force=True) or {}
+        folder = p.get("folder") or ""
+        enc_id = p.get("enc_id") or ""
+        if not folder:
+            return jsonify(ok=False, error="folder required"), 400
+        try:
+            dest, copied, skipped = hnd.handoff_frames_for(folder, enc_id or None)
+        except SystemExit as e:
+            return jsonify(ok=False, error=str(e)), 400
+        except RuntimeError as e:
+            return jsonify(ok=False, error=str(e)), 400
+        if not copied:
+            return jsonify(ok=False, error="no confirmed frames to hand off",
+                           dest=str(dest)), 400
+        try:
+            hnd.open_darktable(dest)
+        except RuntimeError as e:
+            return jsonify(ok=False, error=str(e), dest=str(dest),
+                           copied=len(copied)), 500
+        return jsonify(ok=True, dest=str(dest), copied=len(copied),
+                       skipped=len(skipped))
+
+    @app.route("/api/frame/remove", methods=["POST"])
+    def api_frame_remove():
+        """Drop a bad frame from an encounter's frame set (rewrites its row in
+        candidates.csv; re-picks best_frame if it was removed)."""
+        p = request.get_json(force=True) or {}
+        folder = p.get("folder") or ""
+        enc_id = p.get("enc_id") or ""
+        frame = p.get("frame") or ""
+        if not (folder and enc_id and frame):
+            return jsonify(ok=False, error="folder, enc_id, frame required"), 400
+        c = _find_candidate(folder, enc_id)
+        if c is None:
+            return jsonify(ok=False, error="unknown encounter"), 404
+        frames = list(c.get("frames") or [])
+        if frame not in frames:
+            return jsonify(ok=False, error=f"{frame} is not in this encounter"), 400
+        if len(frames) <= 1:
+            return jsonify(
+                ok=False,
+                error="cannot remove the only frame; mark the encounter not-a-bird"),
+            400
+        try:
+            new_frames, new_best = _remove_candidate_frame(folder, enc_id, frame)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 400
+        return jsonify(ok=True, frames=sorted(new_frames), best_frame=new_best)
 
     @app.route("/api/crop", methods=["POST"])
     def api_crop():

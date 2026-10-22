@@ -44,13 +44,28 @@ def find_regions_toml() -> Path:
     return _PKG_DIR / "regions.toml"
 
 
+def _trip_root(folder: Path) -> Path:
+    """Default root for trip-ID derivation: the photo archive root when the
+    folder sits under it, else the folder's own parent. Using the archive root
+    keeps a nested folder's trip ID the same whether it was reached by
+    run-all (root=~/BIRDING) or by `run`/`develop`/`handoff` with no --root."""
+    folder = folder.resolve()
+    birding = Path.home() / "BIRDING"
+    birding = birding.resolve()
+    try:
+        folder.relative_to(birding)
+        return birding
+    except ValueError:
+        return folder.parent
+
+
 def trip_id_for(folder: Path, root: Path | str | None = None) -> str:
     """Trip ID for a photo folder: the folder name when it sits directly
     under its root (so existing runs/decisions keep working), else the
     root-relative path with the separators replaced by "--" (e.g. a folder
     at root/a/b is trip "a--b")."""
     folder = folder.resolve()
-    root = Path(root).expanduser().resolve() if root else folder.parent
+    root = Path(root).expanduser().resolve() if root else _trip_root(folder)
     try:
         rel = folder.relative_to(root)
     except ValueError:

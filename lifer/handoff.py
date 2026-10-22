@@ -36,6 +36,95 @@ def _is_within(child: Path, parent: Path) -> bool:
         return False
 
 
+def _dest_for(folder: str) -> Path:
+    """Default handoff destination: ~/Pictures/<folder>."""
+    return Path.home() / "Pictures" / folder
+
+
+def deliver_frames(folder: str, source: Path, dest: Path, frames: list[str],
+                   style_sidecar: Path | None, conn: sqlite3.Connection):
+    """Develop any of ``frames`` that lack a lifer edit, then copy each NEF and
+    its '.NEF.xmp' history sidecar into ``dest`` (never overwriting what's
+    there). Returns (copied, skipped, missing) -- ``missing`` is the frames that
+    had to be developed here."""
+    home = lifer_home()
+    out_dir = home / "edits" / folder
+    xmp_dir = out_dir / "xmp"
+    missing = [f for f in frames if not (out_dir / f"{Path(f).stem}.jpg").is_file()]
+    if missing:
+        style = style_sidecar
+        if style is None:
+            raw = (load_config().get("develop", {}) or {}).get("style_sidecar")
+            style = Path(raw) if isinstance(raw, (str, Path)) else None
+        if not style:
+            raise RuntimeError(
+                f"{len(missing)} frame(s) need `lifer develop` but no style "
+                "sidecar (--style-sidecar or [develop] style_sidecar in config.toml)")
+        develop(str(source), frames=missing, style_sidecar=Path(style), conn=conn)
+    copied: list[str] = []
+    skipped: list[str] = []
+    dest.mkdir(parents=True, exist_ok=True)
+    for frame in frames:
+        dest_nef = dest / frame
+        dest_xmp = dest / f"{frame}.xmp"
+        if dest_nef.exists() or dest_xmp.exists():
+            skipped.append(frame)
+            continue
+        src_nef = source / frame
+        if not src_nef.is_file():
+            skipped.append(frame)
+            continue
+        src_xmp = xmp_dir / f"{Path(frame).stem}.xmp"
+        if not src_xmp.is_file():
+            skipped.append(frame)
+            continue
+        shutil.copy2(src_nef, dest_nef)
+        shutil.copy2(src_xmp, dest_xmp)
+        copied.append(frame)
+    return copied, skipped, missing
+
+
+def open_darktable(dest: Path) -> bool:
+    """Launch darktable on ``dest`` in the user's desktop session (detached).
+    Returns True once started; raises RuntimeError if darktable isn't on PATH."""
+    exe = shutil.which("darktable")
+    if not exe:
+        raise RuntimeError("darktable not found on PATH (is it in your Nix profile?)")
+    subprocess.Popen([exe, str(dest)], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+
+def handoff_frames_for(folder: str, enc_id: str | None = None,
+                       dest: Path | None = None, db_path: Path | None = None,
+                       style_sidecar: Path | None = None) -> tuple[Path, list[str], list[str]]:
+    """Resolve ``folder``'s confirmed frames (or just ``enc_id``'s), develop any
+    missing edits, and copy them into ``dest`` (default ~/Pictures/<folder>).
+    Returns (dest, copied, skipped); raises on refusal or missing style."""
+    conn = open_db(db_path)
+    source = source_folder_for_trip(folder)
+    if dest is None:
+        dest = _dest_for(folder)
+    dest = dest.expanduser()
+    if _is_within(dest, BIRDING) or _is_within(dest, source):
+        raise SystemExit(f"refusing to write handoff into {dest} "
+                         "(under the read-only photo share / source folder)")
+    if dest.is_file():
+        raise SystemExit(f"error: destination {dest} is a file, not a folder")
+    encs = [e for e in confirmed_encounters(conn, folder)
+            if not enc_id or e.enc_id == enc_id]
+    chosen: list[str] = []
+    for enc in encs:
+        f = representative_frame(conn, folder, enc.frames, enc.best_frame)
+        if f and f not in chosen:
+            chosen.append(f)
+    if not chosen:
+        return dest, [], []
+    copied, skipped, _missing = deliver_frames(folder, source, dest, chosen,
+                                               style_sidecar, conn)
+    return dest, copied, skipped
+
+
 def confirmed_encounters(conn: sqlite3.Connection, folder: str) -> list[EncRef]:
     """Current encounter refs whose decision is confirm/change with a species.
 
@@ -103,7 +192,6 @@ def handoff(folder_arg: str, dest: Path | None = None, db_path: Path | None = No
             style_sidecar: Path | None = None,
             root: str | Path | None = None) -> int:
     """Hand each confirmed encounter's chosen frame (NEF + .NEF.xmp) to ``dest``."""
-    home = lifer_home()
     conn = open_db(db_path)
 
     arg = Path(folder_arg).expanduser()
@@ -140,44 +228,13 @@ def handoff(folder_arg: str, dest: Path | None = None, db_path: Path | None = No
         if frame not in chosen:
             chosen.append(frame)
 
-    # make sure each chosen frame has a lifer develop edit (run it if missing)
-    out_dir = home / "edits" / folder
-    xmp_dir = out_dir / "xmp"
-    missing = [f for f in chosen if not (out_dir / f"{Path(f).stem}.jpg").is_file()]
-    if missing:
-        style = style_sidecar
-        if style is None:
-            raw = (load_config().get("develop", {}) or {}).get("style_sidecar")
-            style = Path(raw) if isinstance(raw, (str, Path)) else None
-        if not style:
-            print("error: %d frame(s) need `lifer develop` but no style sidecar "
-                  "(--style-sidecar or [develop] style_sidecar in config.toml)" % len(missing))
-            return 2
-        print(f"developing {len(missing)} frame(s): {', '.join(missing)}")
-        develop(str(source), frames=list(missing),
-                style_sidecar=Path(style), root=root, conn=conn)
-
-    # copy NEF + sidecar, never overwriting what's already there
-    copied: list[str] = []
-    skipped: list[str] = []
-    for frame in chosen:
-        dest_nef = dest / frame
-        dest_xmp = dest / f"{frame}.xmp"
-        if dest_nef.exists() or dest_xmp.exists():
-            skipped.append(frame)
-            continue
-        src_nef = source / frame
-        if not src_nef.is_file():
-            skipped.append(frame)
-            continue
-        src_xmp = xmp_dir / f"{Path(frame).stem}.xmp"
-        if not src_xmp.is_file():
-            skipped.append(frame)
-            continue
-        dest.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_nef, dest_nef)
-        shutil.copy2(src_xmp, dest_xmp)
-        copied.append(frame)
+    # develop + copy the chosen frames into dest (idempotent)
+    try:
+        copied, skipped, missing = deliver_frames(
+            folder, source, dest, chosen, style_sidecar, conn)
+    except RuntimeError as e:
+        print(f"error: {e}")
+        return 2
 
     print(f"\nhandoff: {len(copied)} copied, {len(skipped)} skipped, "
           f"{len(missing)} developed now")
