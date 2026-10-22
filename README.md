@@ -140,8 +140,10 @@ To keep the review app running as a service:
 home-manager.users.you.modules = [ (fetchTarball "github:ewtodd/lifer") ];
 ```
 
-The module installs `lifer` (with darktable and exiftool on PATH) and a
-`lifer-serve` systemd service bound to 127.0.0.1.
+Enabling `services.lifer` runs the review app as a `lifer` systemd user
+service bound to 127.0.0.1, and puts the `lifer` CLI on PATH (with darktable
+and exiftool on its own PATH) along with bash and zsh completions: subcommands,
+flags, paths, and trip IDs from your `LIFER_HOME/runs`.
 
 ## Privacy
 

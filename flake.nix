@@ -85,6 +85,15 @@
             # module shells out to them; develop stays torch-free)
             makeWrapperArgs = [ "--prefix" "PATH" ":"
                                 "${pkgs.lib.makeBinPath [ pkgs.exiftool pkgs.darktable ]}" ];
+            # bash/zsh completions, generated from the argparse parser with
+            # shtab (build-time only; see lifer/completion.py)
+            nativeBuildInputs = [ pkgs.installShellFiles pythonPackages.shtab ];
+            postInstall = ''
+              export PYTHONPATH=$out/${python.sitePackages}:$PYTHONPATH
+              installShellCompletion --cmd lifer \
+                --bash <(${python.interpreter} -m lifer.completion bash) \
+                --zsh <(${python.interpreter} -m lifer.completion zsh)
+            '';
             doCheck = false;
             meta = {
               description = "Bird photo pipeline: detect, identify, review, develop";
@@ -172,13 +181,20 @@
                 echo "Environment=${lib.concatStringsSep " " svc.Service.Environment}" >> $out/service
                 grep -q "lifer serve" $out/service
                 grep -q "LIFER_HOME" $out/service
+                # enabling the service also puts the CLI + completions on PATH
+                ${lib.optionalString
+                    (!lib.any (p: (p.pname or "") == "lifer") hm.config.home.packages)
+                    ''echo "lifer missing from home.packages"; exit 1''}
+                test -s ${lifer}/share/bash-completion/completions/lifer.bash
+                test -s ${lifer}/share/zsh/site-functions/_lifer
               '';
           };
         };
 
       # A home-manager module: `services.lifer = { enable; port ? 8737;
       # home ? ...; }` runs `lifer serve` as a systemd user service with
-      # LIFER_HOME set. Uses HM 26.05's modular-services API
+      # LIFER_HOME set, and puts the `lifer` CLI (with its bash/zsh
+      # completions) on PATH. Uses HM 26.05's modular-services API
       # (home.services.<name>.systemd.services."").
       homeManagerModule =
         { config, lib, pkgs, ... }:
@@ -187,7 +203,7 @@
         in
         {
           options.services.lifer = {
-            enable = lib.mkEnableOption "the lifer review app (systemd user service)";
+            enable = lib.mkEnableOption "the lifer review app (systemd user service) and the lifer CLI";
             host = lib.mkOption {
               type = lib.types.str;
               default = "127.0.0.1";
@@ -206,6 +222,8 @@
           };
 
           config = lib.mkIf cfg.enable {
+            # the same package the service runs, so CLI and app always agree
+            home.packages = [ pkgs.lifer ];
             home.services.lifer = {
               systemd.mainExecStart =
                 "${pkgs.lifer}/bin/lifer serve --host ${cfg.host} --port ${toString cfg.port} --db ${cfg.home}/data/lifer.sqlite";
