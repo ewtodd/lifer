@@ -14,6 +14,7 @@ import json
 import sys
 import time
 import tomllib
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,14 +26,16 @@ from .bioclip import BioCLIP, label_text
 from .boxes import get_box, open_db, removed_frames
 from .bursts import Encounter, FrameInfo, group_into_encounters
 from .detect import (BirdDetector, Detection, FrameDetections, sharpness,
-                     square_crop, usable_crop)
-from .extract import jpeg_to_image, load_frame, load_frame_jpg, load_photo
+                     square_box, square_crop, usable_crop)
+from .extract import (Frame, jpeg_to_image, load_frame, load_frame_jpg,
+                      load_photo)
 from .home import effective_trip_id, find_regions_toml, lifer_home
 from .lifelist import (LifeEntry, lifer_set, match_lifelist, parse_lifelist,
                        write_lifelist_csv)
 from .outputs import Candidate, save_crop, save_frame_preview, write_candidates_csv, write_review_html
 from .region import (lifelist_place_counts, normalized, region_display_names,
                      species_counts)
+from .subject import CENTRE, read_af_points
 from .taxonomy import aves_species
 
 LIFELIST = Path.home() / "BIRDING" / "LIFELIST.ods"
@@ -84,16 +87,39 @@ def _frame_cache_path(cache_dir: Path, nef: Path) -> Path:
     return cache_dir / f"{nef.stem}.json"
 
 
-def load_frame_with_dets(
-    nef: Path, detector: BirdDetector, cache_dir: Path
-) -> FrameRecord:
-    """Extract + detect one NEF, using the per-frame cache when valid."""
-    cache = _frame_cache_path(cache_dir, nef)
-    key = {
+class AFPoints:
+    """A folder's AF points, read with one exiftool call on first use (a
+    fully cached re-run never needs them)."""
+
+    def __init__(self, folder: Path):
+        self.folder = folder
+        self._points: dict[str, tuple[float, float]] | None = None
+
+    def get(self, name: str) -> tuple[float, float]:
+        if self._points is None:
+            self._points = read_af_points(self.folder)
+        return self._points.get(name, CENTRE)
+
+
+def _cache_key(detector: BirdDetector) -> dict:
+    return {
         "yolo": detector.weights_key,
         "imgsz": detector.imgsz,
         "conf": detector.conf,
+        "recipe": detector.recipe,
     }
+
+
+def _read_photo(photo: Path) -> Frame:
+    return load_frame(photo) if photo.suffix.lower() == ".nef" else load_frame_jpg(photo)
+
+
+def cached_record(nef: Path, detector: BirdDetector,
+                  cache_dir: Path) -> FrameRecord | None:
+    """The frame's record from the per-frame cache, or None when missing,
+    stale (file or detector recipe changed) or corrupt."""
+    cache = _frame_cache_path(cache_dir, nef)
+    key = _cache_key(detector)
     st = nef.stat()
     if cache.exists():
         try:
@@ -101,8 +127,11 @@ def load_frame_with_dets(
             if (data.get("name") == nef.name and data.get("mtime") == st.st_mtime
                     and data.get("size") == st.st_size and data.get("key") == key):
                 dets = data["dets"]
-                fd = FrameDetections(frame_name=nef.name, dets=[
-                    Detection(d[0], d[1], d[2], d[3], d[4]) for d in dets])
+                fd = FrameDetections(
+                    frame_name=nef.name,
+                    dets=[Detection(d[0], d[1], d[2], d[3], d[4]) for d in dets],
+                    af=tuple(data.get("af") or CENTRE),
+                    width=data.get("width", 0), height=data.get("height", 0))
                 return FrameRecord(
                     path=nef, name=nef.name,
                     timestamp=datetime.fromisoformat(data["timestamp"]),
@@ -110,17 +139,53 @@ def load_frame_with_dets(
                 )
         except (json.JSONDecodeError, KeyError, ValueError):
             pass  # corrupt cache entry: recompute
+    return None
 
-    frame = (load_frame(nef) if nef.suffix.lower() == ".nef"
-             else load_frame_jpg(nef))
-    image = jpeg_to_image(frame.jpeg)
-    fd = detector.detect(image)
+
+def _prefetch_frames(photos: list[Path], detector: BirdDetector,
+                     cache_dir: Path, ahead: int = 8):
+    """Yield (photo, frame) with the frames of uncached photos read on worker
+    threads a few ahead: reading a NEF off the NFS share (~0.3 s) costs more
+    than detecting it (~0.07 s on the GPU). `frame` is None for cached photos."""
+    futures: dict[int, Future] = {}
+    queued = 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for i, photo in enumerate(photos):
+            while queued < min(i + ahead, len(photos)):
+                if cached_record(photos[queued], detector, cache_dir) is None:
+                    futures[queued] = pool.submit(_read_photo, photos[queued])
+                queued += 1
+            fut = futures.pop(i, None)
+            yield photo, (fut.result() if fut else None)
+
+
+def load_frame_with_dets(
+    nef: Path, detector: BirdDetector, cache_dir: Path,
+    af_points: AFPoints | None = None, frame: Frame | None = None,
+) -> FrameRecord:
+    """Extract + detect one NEF, using the per-frame cache when valid.
+    `frame` is the already-read photo, when the caller prefetched it."""
+    rec = cached_record(nef, detector, cache_dir)
+    if rec is not None:
+        return rec
+    cache = _frame_cache_path(cache_dir, nef)
+    key = _cache_key(detector)
+    st = nef.stat()
+    if frame is None:
+        frame = _read_photo(nef)
+    af = af_points.get(nef.name) if af_points is not None else CENTRE
+    gpu = detector.decode(frame.jpeg)
+    fd = detector.detect(gpu, af)
     fd.frame_name = nef.name
     if fd.best is not None:
-        crop = square_crop(image, fd.best)
+        # cut the sharpness crop on the GPU: no CPU decode of the full frame
+        l, t, r, b = square_box((fd.width, fd.height), fd.best)
+        crop = Image.fromarray(
+            gpu[:, t:b, l:r].permute(1, 2, 0).contiguous().cpu().numpy())
         sh = sharpness(crop)
     else:
         sh = -1.0
+    del gpu
     rec = FrameRecord(
         path=nef, name=nef.name, timestamp=frame.timestamp,
         dets=fd, sharpness=sh, _jpeg=frame.jpeg,
@@ -130,7 +195,8 @@ def load_frame_with_dets(
         "name": nef.name, "mtime": st.st_mtime, "size": st.st_size, "key": key,
         "timestamp": frame.timestamp.isoformat(),
         "dets": [[d.x1, d.y1, d.x2, d.y2, d.conf] for d in fd.dets],
-        "width": image.width, "height": image.height,
+        "af": [af[0], af[1]],
+        "width": fd.width, "height": fd.height,
         "sharpness": sh,
     }))
     return rec
@@ -163,7 +229,8 @@ def classify_encounter(
     skip_cache = set()
     for f in sharpest:
         rec = records[f.name]
-        box = get_box(folder, f.name, conn, dets=rec.dets.dets)
+        box = get_box(folder, f.name, conn, dets=rec.dets.dets,
+                      af=rec.dets.af, size=(rec.dets.width, rec.dets.height))
         if box is None:
             continue
         cf = _crop_cache_path(cache_dir, rec.path)
@@ -211,7 +278,7 @@ def classify_encounter(
 def run_folder(folder_arg: str | Path, root: str | Path | None = None,
                gap_seconds: float = 5.0,
                alpha: float = 0.3,
-               yolo_weights: str = "yolo11m.pt", imgsz: int = 1280,
+               yolo_weights: str = "yolo11m.pt", imgsz: int = 2560,
                conf: float = 0.25, temperature: float = 3.0) -> Path:
     t_start = time.time()
     folder = Path(folder_arg).expanduser().resolve()
@@ -271,8 +338,10 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
         raise SystemExit(f"no .NEF or .jpg/.jpeg files in {folder}")
     detector = BirdDetector(weights=yolo_weights, imgsz=imgsz, conf=conf)
     records: dict[str, FrameRecord] = {}
-    for i, photo in enumerate(photos, 1):
-        rec = load_frame_with_dets(photo, detector, cache_dir)
+    af_points = AFPoints(folder)
+    for i, (photo, frame) in enumerate(
+            _prefetch_frames(photos, detector, cache_dir), 1):
+        rec = load_frame_with_dets(photo, detector, cache_dir, af_points, frame)
         records[rec.name] = rec
         if i % 25 == 0 or i == len(photos):
             print(f"  frames {i}/{len(photos)} "
@@ -430,7 +499,8 @@ def run_folder(folder_arg: str | Path, root: str | Path | None = None,
         ))
         # best crop for the review page (no-detection encounters never get
         # here; they are listed in the "No bird detected" section instead)
-        crop_box = get_box(name, best.name, db_conn, dets=rec.dets.dets)
+        crop_box = get_box(name, best.name, db_conn, dets=rec.dets.dets,
+                           af=rec.dets.af, size=(rec.dets.width, rec.dets.height))
         if crop_box is not None:
             image = jpeg_to_image(rec._jpeg) if rec._jpeg else load_photo(rec.path)
             save_crop(square_crop(image, crop_box), out_dir / "crops" / f"{enc_id}.jpg")

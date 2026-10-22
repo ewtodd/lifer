@@ -40,6 +40,7 @@ from .extract import load_photo
 from .home import lifer_home, find_regions_toml, source_folder_for_trip
 from .outputs import CSS, save_crop, save_frame_preview
 from .region import region_display_names
+from .subject import subject_from_cache
 
 # state dir without importing .pipeline (that pulls in torch; serving needs no GPU)
 RUNS = lifer_home() / "runs"
@@ -740,11 +741,8 @@ def _frame_cache(folder: str, frame: str) -> dict | None:
 
 
 def _best_det(cache: dict | None) -> list | None:
-    """(x1,y1,x2,y2,conf) of the highest-confidence detection, else None."""
-    dets = (cache or {}).get("dets") or []
-    if not dets:
-        return None
-    return max(dets, key=lambda d: d[4] if len(d) > 4 else 0.0)
+    """(x1,y1,x2,y2,conf) of the subject detection (nearest the AF point), else None."""
+    return subject_from_cache(cache)
 
 
 def _quality_score(enc: dict) -> tuple[float, float]:

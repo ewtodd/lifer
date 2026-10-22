@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .home import lifer_home
+from .subject import subject_det, subject_from_cache
 
 
 @dataclass
@@ -99,27 +100,29 @@ def get_override(conn: sqlite3.Connection, folder: str, frame: str) -> Box | Non
 
 
 def get_detector_box(folder: str, frame: str) -> Box | None:
-    """Best detection for a frame from its cached dets (full-pixel coords)."""
+    """Subject detection for a frame from its cache (full-pixel coords): the
+    one nearest the AF point."""
     p = lifer_home() / "cache" / folder / f"{Path(frame).stem}.json"
     if not p.is_file():
         return None
     try:
-        dets = (json.loads(p.read_text()) or {}).get("dets") or []
+        det = subject_from_cache(json.loads(p.read_text()))
     except (json.JSONDecodeError, OSError):
         return None
-    if not dets:
-        return None
-    return _box_from(max(dets, key=_conf))
+    return _box_from(det) if det else None
 
 
 def get_box(folder: str, frame: str,
-            conn: sqlite3.Connection | None = None, dets=None) -> Box | None:
+            conn: sqlite3.Connection | None = None, dets=None,
+            af=None, size=None) -> Box | None:
     """The box used for a frame: override if present, else the detector box.
 
     `dets` may be supplied when the caller already has the frame's detections
     (e.g. the pipeline) to avoid re-reading the cache; it is a list of objects
-    with .x1/.y1/.x2/.y2/.conf or [x1,y1,x2,y2,conf] tuples. When `conn` is
-    None a short-lived connection to the default DB is opened.
+    with .x1/.y1/.x2/.y2/.conf or [x1,y1,x2,y2,conf] tuples; the subject is
+    the one nearest the AF point `af` (normalised) in a frame of `size`
+    (w, h), and without them the highest confidence. When `conn` is None a
+    short-lived connection to the default DB is opened.
     """
     if conn is None:
         conn = open_db()
@@ -133,7 +136,8 @@ def get_box(folder: str, frame: str,
         if dets is not None:
             if not dets:
                 return None
-            return _box_from(max(dets, key=_conf))
+            w, h = size or (None, None)
+            return _box_from(subject_det(dets, af, w, h))
         return get_detector_box(folder, frame)
     finally:
         if own:

@@ -39,7 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--alpha", type=float, default=0.3, help="seasonal-prior exponent (default 0.3)")
     run.add_argument("--yolo", default="yolo11m.pt", help="YOLO weights (default yolo11m.pt)"
                      ).complete = FILES
-    run.add_argument("--imgsz", type=int, default=1280, help="detection input size (default 1280)")
+    run.add_argument("--imgsz", type=int, default=2560,
+                     help="high-resolution detection pass (default 2560; a 1280 pass always runs too)")
     run.add_argument("--conf", type=float, default=0.25, help="detection confidence threshold (default 0.25)")
     run.add_argument("--temp", type=float, default=3.0,
                      help="BioCLIP temperature: logits/T before softmax (default 3.0)")
@@ -55,7 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     runall.add_argument("--alpha", type=float, default=0.3, help="seasonal-prior exponent (default 0.3)")
     runall.add_argument("--yolo", default="yolo11m.pt", help="YOLO weights (default yolo11m.pt)"
                         ).complete = FILES
-    runall.add_argument("--imgsz", type=int, default=1280, help="detection input size (default 1280)")
+    runall.add_argument("--imgsz", type=int, default=2560,
+                     help="high-resolution detection pass (default 2560; a 1280 pass always runs too)")
     runall.add_argument("--conf", type=float, default=0.25, help="detection confidence threshold (default 0.25)")
     runall.add_argument("--temp", type=float, default=3.0,
                         help="BioCLIP temperature: logits/T before softmax (default 3.0)")

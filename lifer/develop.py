@@ -33,6 +33,7 @@ import numpy as np
 from PIL import Image
 
 from .boxes import get_box, open_db, representative_frame
+from .subject import subject_from_cache
 from .extract import load_frame
 from .home import effective_trip_id, lifer_home
 from .dxmp import (NO_MASK_BLENDOP, Module, crop_params, decode_params,
@@ -148,12 +149,10 @@ def _pick_frame_names(
     return picked
 
 
-def _best_box(dets: list) -> Box | None:
-    """The highest-confidence detection box from a cache entry."""
-    if not dets:
-        return None
-    best = max(dets, key=lambda d: d[4])
-    return Box(best[0], best[1], best[2], best[3])
+def _best_box(cache: dict | None) -> Box | None:
+    """The subject detection box (nearest the AF point) from a cache entry."""
+    best = subject_from_cache(cache)
+    return Box(best[0], best[1], best[2], best[3]) if best else None
 
 
 def _compute_crop(box: Box, img_w: float, img_h: float) -> Box:
@@ -452,7 +451,7 @@ document.querySelectorAll('.slider').forEach(el => {{
 def _bird_det_box(cache_dir: Path, name: str) -> tuple[float, float, float, float] | None:
     """Normalized [x0,x1,y0,y1] bird box for a frame (full-frame coords)."""
     data = _cache_frame(cache_dir, name)
-    box = _best_box(data.get("dets", [])) if data else None
+    box = _best_box(data)
     if box is not None:
         return (box.x1 / 6000, box.x2 / 6000, box.y1 / 4000, box.y2 / 4000)
     return None
@@ -544,7 +543,9 @@ def develop(source_folder: str, species: str = "", n: int = 5,
             shutil.copy2(source / name, src_nef)
 
         data = _cache_frame(cache_dir, name) or {}
-        det_box = get_box(folder, name, conn, dets=data.get("dets", []))
+        det_box = get_box(folder, name, conn, dets=data.get("dets", []),
+                          af=data.get("af"),
+                          size=(data.get("width"), data.get("height")))
         if det_box is None:
             print(f"skip {name}: no detection")
             continue
@@ -655,7 +656,7 @@ def benchmark(source_folder: str, reference_dir: Path,
         crop = Box(left * bw, top * bh, right * bw, bottom * bh)
 
         data = _cache_frame(cache_dir, name)
-        box = _best_box(data.get("dets", [])) if data else None
+        box = _best_box(data)
         if box is None:
             ev = 0.7
             lift = 0.0

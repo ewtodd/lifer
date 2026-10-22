@@ -33,9 +33,9 @@ def load_frame(path: Path) -> Frame:
         jpeg = bytes(thumb.data)
         ts = raw.other.timestamp
 
-    # Fail loudly on a corrupt/empty preview rather than propagating garbage.
+    # Fail loudly on an empty/tiny preview (header only: the pixels are decoded
+    # once, on the GPU, by the detector, which also fails on a corrupt file).
     with Image.open(io.BytesIO(jpeg)) as im:
-        im.load()
         if im.size[0] < 512:  # a real JpgFromRaw on a D5600 is 6000x4000
             raise RuntimeError(f"embedded preview in {path} is only {im.size}")
 
@@ -68,7 +68,6 @@ def load_frame_jpg(path: Path) -> Frame:
     EXIF DateTimeOriginal. Same contract as load_frame."""
     jpeg = path.read_bytes()
     with Image.open(io.BytesIO(jpeg)) as im:
-        im.load()
         if im.size[0] < 512:  # refuse thumbnails / watermarks as sources
             raise RuntimeError(f"JPEG {path} is only {im.size}")
         ts = _exif_original_datetime(im)
