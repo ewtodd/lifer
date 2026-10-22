@@ -1092,6 +1092,34 @@ def build_sightings(conn: sqlite3.Connection) -> dict[str, dict]:
 
     for entry in recs.values():
         s = entry["sightings"]
+        ods = [x for x in s if x["source"] == "ods"]
+        trips = [x for x in s if x["source"] == "trip"]
+        if ods:
+            # This species is on the historical lifelist, so it's never "new",
+            # even when every ODS row folds into a trip.
+            entry["_has_ods"] = True
+            trip_places = {t["place"] for t in trips}
+            folded = [o for o in ods if o["place"] in trip_places]
+            kept_ods = [o for o in ods if o["place"] not in trip_places]
+            # Fold an ODS row into the confirmed trip at the same place so the
+            # same observation isn't counted twice. Keep the earliest date
+            # so `first` reflects the ODS record where it predates the photo.
+            for o in folded:
+                best, best_delta = None, None
+                for t in trips:
+                    if t["place"] != o["place"]:
+                        continue
+                    od = o["date_dt"]; td = t["date_dt"]
+                    delta = abs((td - od).days) if (od and td) else 10 ** 9
+                    if best is None or delta < best_delta:
+                        best, best_delta = t, delta
+                if best is not None:
+                    od = o["date_dt"]; bd = best["date_dt"]
+                    if od and (bd is None or od < bd):
+                        best["date_dt"] = od
+                        best["date"] = o["date"]
+            entry["sightings"] = kept_ods + trips
+        s = entry["sightings"]
         s.sort(key=lambda x: (x["date_dt"] or date.min, x["source"]), reverse=True)
 
     return recs
@@ -1139,7 +1167,7 @@ def build_lifelist(conn: sqlite3.Connection, sort: str = "taxon") -> list[dict]:
             "latest_location": latest["place"],
             "latest_photo_date": latest_photo["date"] if latest_photo else None,
             "count": len(rec["sightings"]),
-            "new": not any(x["source"] == "ods" for x in rec["sightings"]),
+            "new": not rec.get("_has_ods", False),
             "thumb": _sighting_view(latest_photo, conn) if latest_photo else None,
             "sightings": [
                 {"date": x["date"], "place": x["place"], "thumb": _sighting_view(x, conn)}
